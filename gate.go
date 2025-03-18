@@ -2,12 +2,16 @@ package main
 
 import (
 	"go.minekube.com/gate/cmd/gate"
-	"github.com/minekube/gate-plugin-template/plugins/ipblacklist"
+	"go.minekube.com/gate/pkg/edition/java/proxy"
+	"./plugins/ipblacklist" // lokaler Import deines Plugins
 )
 
 func main() {
+	// Plugin registrieren
 	proxy.Plugins = append(proxy.Plugins,
-        	ipblacklist.Plugin,
-    	)
+		ipblacklist.Plugin,
+	)
+	
+	// Gate starten
 	gate.Execute()
 }
