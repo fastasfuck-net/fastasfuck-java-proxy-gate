@@ -1,4 +1,4 @@
-// Package ipblacklist implementiert eine IP-Blacklist für Gate (Lite-Version)
+// Package ipblacklist implementiert eine IP-Blacklist für Gate
 package ipblacklist
 
 import (
@@ -15,17 +15,16 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/robinbraemer/event"
 	c "go.minekube.com/common/minecraft/component"
-	"go.minekube.com/gate/pkg/edition/java/lite/proxy"
-	javaproxy "go.minekube.com/gate/pkg/edition/java/proxy"
+	"go.minekube.com/gate/pkg/edition/java/proxy"
 )
 
 // Plugin ist ein IP-Blacklist-Plugin, das Verbindungen von Spielern ablehnt,
 // die auf einer Blacklist stehen, die regelmäßig von einer URL aktualisiert wird.
-var Plugin = javaproxy.Plugin{
+var Plugin = proxy.Plugin{
 	Name: "IPBlacklist",
-	Init: func(ctx context.Context, p *javaproxy.Proxy) error {
+	Init: func(ctx context.Context, p *proxy.Proxy) error {
 		log := logr.FromContextOrDiscard(ctx)
-		log.Info("IP Blacklist Plugin wird initialisiert (Lite-Version)...")
+		log.Info("IP Blacklist Plugin wird initialisiert...")
 
 		// Erstelle eine neue Instanz des Plugins
 		plugin := &blacklistPlugin{
@@ -47,12 +46,10 @@ var Plugin = javaproxy.Plugin{
 		// Starte den Update-Prozess im Hintergrund
 		go plugin.startBlacklistUpdater(ctx)
 
-		// Für die Lite-Version müssen wir den Handler für initialConnectionEvent verwenden
+		// Abonniere alle Events und filtre nach Typ
 		event.Subscribe(p.Event(), 0, func(e event.Event) {
-			// Versuche verschiedene Event-Typen zu erkennen
-			if connEvent, ok := e.(*proxy.InitialConnectionEvent); ok {
-				plugin.handleInitialConnection(connEvent)
-			}
+			// Versuchen, verschiedene Arten von Events zu verarbeiten
+			plugin.handleEvent(e)
 		})
 
 		log.Info("IP Blacklist Plugin erfolgreich initialisiert!", 
@@ -78,56 +75,208 @@ type BlacklistEntry struct {
 	IP string `json:"ip"`
 }
 
-// handleInitialConnection wird bei einer initialen Verbindung aufgerufen (Lite-Version)
-func (p *blacklistPlugin) handleInitialConnection(e *proxy.InitialConnectionEvent) {
-	// Extrahiere die IP-Adresse aus der Remote-Adresse
-	conn := e.InitialConnection()
-	if conn == nil {
-		p.log.Error(nil, "Keine Verbindung im InitialConnectionEvent")
-		return
+// handleEvent verarbeitet verschiedene Event-Typen
+func (p *blacklistPlugin) handleEvent(e event.Event) {
+	// Extrahieren von IP-Adresse und Abbruchmöglichkeit je nach Event-Typ
+	var ipAddr string
+	var virtualHost string
+	var disconnect func(c.Component)
+
+	// Typ des Events ermitteln und entsprechende Informationen extrahieren
+	switch eventType := e.(type) {
+	case *proxy.LoginEvent:
+		if player := eventType.Player(); player != nil {
+			ipAddr = extractIP(player.RemoteAddr())
+			virtualHost = player.VirtualHost().String()
+			disconnect = player.Disconnect
+		}
+	default:
+		// Versuchen, die allgemeinen Schnittstellen-Methoden aufzurufen
+		// über Reflection oder Typ-Assertion, wenn möglich
+		
+		// 1. Versuchen, ob das Event einen RemoteAddr()-Methode hat
+		ipAddr = tryGetRemoteAddr(e)
+		
+		// 2. Versuchen, ob das Event einen VirtualHost()-Methode hat
+		virtualHost = tryGetVirtualHost(e)
 	}
 
-	remoteAddr := conn.RemoteAddr()
-	ipAddr := extractIP(remoteAddr)
-	
-	// Extrahiere den virtuellen Host (Domain), falls vorhanden
-	virtualHost := "unbekannt"
-	if vHost := conn.VirtualHost(); vHost != nil {
-		virtualHost = vHost.String()
-	}
-
-	// Zeige IP-Adresse in der Konsole an
-	if ipAddr == "" {
-		p.log.Info("Verbindung - IP konnte nicht extrahiert werden", 
-			"addr", remoteAddr,
-			"virtualHost", virtualHost)
-	} else {
-		// Zeige die IP-Adresse deutlich in der Konsole an
-		p.log.Info("Neue Verbindung", 
-			"ip", ipAddr,
-			"virtualHost", virtualHost)
-	}
-
-	// Wenn keine IP extrahiert werden konnte, brechen wir hier ab
+	// Wenn keine IP extrahiert werden konnte, beende hier
 	if ipAddr == "" {
 		return
 	}
+
+	// IP-Adresse in der Konsole anzeigen
+	p.log.Info("Verbindung", 
+		"ip", ipAddr,
+		"virtualHost", virtualHost,
+		"eventType", fmt.Sprintf("%T", e))
 
 	// Prüfe, ob die IP in der Blacklist ist
 	if p.isBlocked(ipAddr) {
 		p.log.Info("Verbindung von geblockter IP abgelehnt", 
-			"ip", ipAddr, 
+			"ip", ipAddr,
 			"virtualHost", virtualHost)
 
-		// Ablehnen der Verbindung mit einer Nachricht
-		disconnectMessage := &c.Text{
-			Content: p.blockMessage,
+		// Wenn wir die Möglichkeit haben, die Verbindung zu trennen
+		if disconnect != nil {
+			disconnect(&c.Text{Content: p.blockMessage})
+		} else {
+			// Versuchen, disconnect über Reflection aufzurufen
+			tryDisconnect(e, &c.Text{Content: p.blockMessage})
 		}
-
-		// Die Disconnect-Methode wird aufgerufen, um die Verbindung zu trennen
-		// In der Lite-Version muss InitialConnection.Disconnect verwendet werden
-		conn.Disconnect(disconnectMessage)
 	}
+}
+
+// tryGetRemoteAddr versucht, die RemoteAddr()-Methode eines beliebigen Events aufzurufen
+func tryGetRemoteAddr(e interface{}) string {
+	// Versuche verschiedene Methoden und Schnittstellen:
+	// 1. Direkte Typumwandlung zu bekannten Schnittstellen
+	type remoteAddressProvider interface {
+		RemoteAddr() net.Addr
+	}
+	if provider, ok := e.(remoteAddressProvider); ok {
+		return extractIP(provider.RemoteAddr())
+	}
+
+	// 2. Versuche, ob das Event eine Methode Connection() oder InitialConnection() hat
+	type connectionProvider interface {
+		Connection() interface{ RemoteAddr() net.Addr }
+	}
+	if provider, ok := e.(connectionProvider); ok {
+		if conn := provider.Connection(); conn != nil {
+			return extractIP(conn.RemoteAddr())
+		}
+	}
+
+	type initialConnectionProvider interface {
+		InitialConnection() interface{ RemoteAddr() net.Addr }
+	}
+	if provider, ok := e.(initialConnectionProvider); ok {
+		if conn := provider.InitialConnection(); conn != nil {
+			return extractIP(conn.RemoteAddr())
+		}
+	}
+
+	// 3. Fallback: versuche, IP aus Event-Beschreibung zu extrahieren
+	if stringer, ok := e.(fmt.Stringer); ok {
+		desc := stringer.String()
+		// Suche nach IP-Mustern in der Beschreibung
+		return extractIPFromString(desc)
+	}
+
+	return ""
+}
+
+// tryGetVirtualHost versucht, die VirtualHost()-Methode eines beliebigen Events aufzurufen
+func tryGetVirtualHost(e interface{}) string {
+	// Versuche verschiedene Methoden und Schnittstellen
+	type virtualHostProvider interface {
+		VirtualHost() interface{ String() string }
+	}
+	if provider, ok := e.(virtualHostProvider); ok {
+		if vh := provider.VirtualHost(); vh != nil {
+			return vh.String()
+		}
+	}
+
+	// Versuche andere Möglichkeiten, den virtuellen Host zu erhalten
+	type connectionProvider interface {
+		Connection() interface{
+			VirtualHost() interface{ String() string }
+		}
+	}
+	if provider, ok := e.(connectionProvider); ok {
+		if conn := provider.Connection(); conn != nil {
+			if vh := conn.VirtualHost(); vh != nil {
+				return vh.String()
+			}
+		}
+	}
+
+	type initialConnectionProvider interface {
+		InitialConnection() interface{
+			VirtualHost() interface{ String() string }
+		}
+	}
+	if provider, ok := e.(initialConnectionProvider); ok {
+		if conn := provider.InitialConnection(); conn != nil {
+			if vh := conn.VirtualHost(); vh != nil {
+				return vh.String()
+			}
+		}
+	}
+
+	return "unbekannt"
+}
+
+// tryDisconnect versucht, die Disconnect()-Methode eines beliebigen Events aufzurufen
+func tryDisconnect(e interface{}, reason c.Component) {
+	// 1. Versuche direkt die Disconnect-Methode aufzurufen
+	type disconnector interface {
+		Disconnect(c.Component)
+	}
+	if d, ok := e.(disconnector); ok {
+		d.Disconnect(reason)
+		return
+	}
+
+	// 2. Versuche über Connection/InitialConnection
+	type connectionProvider interface {
+		Connection() interface{ Disconnect(c.Component) }
+	}
+	if provider, ok := e.(connectionProvider); ok {
+		if conn := provider.Connection(); conn != nil {
+			conn.Disconnect(reason)
+			return
+		}
+	}
+
+	type initialConnectionProvider interface {
+		InitialConnection() interface{ Disconnect(c.Component) }
+	}
+	if provider, ok := e.(initialConnectionProvider); ok {
+		if conn := provider.InitialConnection(); conn != nil {
+			conn.Disconnect(reason)
+			return
+		}
+	}
+
+	// 3. Versuche über Player-Methode
+	type playerProvider interface {
+		Player() interface{ Disconnect(c.Component) }
+	}
+	if provider, ok := e.(playerProvider); ok {
+		if player := provider.Player(); player != nil {
+			player.Disconnect(reason)
+			return
+		}
+	}
+}
+
+// extractIPFromString extrahiert eine IP-Adresse aus einem String
+func extractIPFromString(s string) string {
+	// Einfacher Ansatz: suche nach IP-ähnlichen Mustern
+	// IPv4-Regex-Muster könnte hier verwendet werden
+	
+	// Suche nach "IP: x.x.x.x" oder ähnlichen Mustern
+	parts := strings.Split(s, " ")
+	for _, part := range parts {
+		// Prüfe, ob es eine IP-Adresse sein könnte
+		if ip := net.ParseIP(part); ip != nil {
+			return ip.String()
+		}
+	}
+
+	// Versuche, aus Mustern wie "1.2.3.4:5678" zu extrahieren
+	for _, part := range parts {
+		host, _, err := net.SplitHostPort(part)
+		if err == nil && net.ParseIP(host) != nil {
+			return host
+		}
+	}
+
+	return ""
 }
 
 // extractIP extrahiert die IP-Adresse aus einer Netzwerkadresse
