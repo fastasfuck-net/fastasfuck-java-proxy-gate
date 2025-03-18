@@ -46,8 +46,8 @@ var Plugin = proxy.Plugin{
 		go plugin.startBlacklistUpdater(ctx)
 
 		// Registriere den Event-Handler für eingehende Verbindungen
-		// Verwende den korrekten Event-Typ
-		p.Event().Subscribe(&proxy.LoginEvent{}, plugin.handleInbound)
+		// Nutze die korrekte API für die Event-Registrierung
+		event.Subscribe(p.Event(), 0, plugin.handleInbound)
 
 		log.Info("IP Blacklist Plugin erfolgreich initialisiert!", 
 			"blacklistURL", plugin.blacklistURL,
@@ -73,8 +73,15 @@ type BlacklistEntry struct {
 }
 
 // handleInbound wird aufgerufen, wenn ein Spieler versucht, sich zu verbinden
-func (p *blacklistPlugin) handleInbound(e *proxy.LoginEvent) {
-	player := e.Player()
+func (p *blacklistPlugin) handleInbound(e event.Event) {
+	// Typumwandlung zum korrekten Event-Typ
+	loginEvent, ok := e.(*proxy.LoginEvent)
+	if !ok {
+		p.log.Error(nil, "Falscher Event-Typ erhalten", "type", e)
+		return
+	}
+
+	player := loginEvent.Player()
 	if player == nil {
 		p.log.Error(nil, "Kein Spieler im LoginEvent")
 		return
