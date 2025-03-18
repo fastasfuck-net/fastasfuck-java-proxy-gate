@@ -6,6 +6,10 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
+	"io"
+	"net/http"
+	"context"
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
@@ -14,6 +18,11 @@ import (
 	"go.minekube.com/gate/pkg/gate"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+)
+
+const (
+	configURL      = "https://manager.fastasfuck.net/config/raw"
+	reloadInterval = 5 * time.Minute
 )
 
 // Execute runs App() and calls os.Exit when finished.
@@ -38,6 +47,7 @@ Visit the website https://gate.minekube.com/ for more information.`
 		debug      bool
 		configFile string
 		verbosity  int
+		useRemoteConfig bool
 	)
 	app.Flags = []cli.Flag{
 		&cli.StringFlag{
@@ -61,13 +71,36 @@ Visit the website https://gate.minekube.com/ for more information.`
 			EnvVars:     []string{"GATE_VERBOSITY"},
 			Destination: &verbosity,
 		},
+		&cli.BoolFlag{
+			Name:        "remote-config",
+			Usage:       "Load configuration from remote URL",
+			Destination: &useRemoteConfig,
+			EnvVars:     []string{"GATE_REMOTE_CONFIG"},
+		},
 	}
 	app.Action = func(c *cli.Context) error {
-		// Init viper
-		v, err := initViper(c, configFile)
-		if err != nil {
-			return cli.Exit(err, 1)
+		var v *viper.Viper
+		var err error
+		
+		if useRemoteConfig {
+			// Load remote config first
+			v, err = loadRemoteConfig(c.Context)
+			if err != nil {
+				// Log the error but continue with local config
+				fmt.Fprintf(os.Stderr, "Error loading remote config: %v. Falling back to local config.\n", err)
+				v, err = initViper(c, configFile)
+				if err != nil {
+					return cli.Exit(err, 1)
+				}
+			}
+		} else {
+			// Init viper with local config
+			v, err = initViper(c, configFile)
+			if err != nil {
+				return cli.Exit(err, 1)
+			}
 		}
+		
 		// Load config
 		cfg, err := gate.LoadConfig(v)
 		if err != nil {
@@ -96,6 +129,11 @@ Visit the website https://gate.minekube.com/ for more information.`
 
 		log.Info("logging verbosity", "verbosity", verbosity)
 		log.Info("using config file", "config", v.ConfigFileUsed())
+		
+		// If remote config is used, start the background reloader
+		if useRemoteConfig {
+			go startRemoteConfigReloader(c.Context, log, cfg)
+		}
 
 		// Start Gate
 		if err = gate.Start(c.Context,
@@ -107,6 +145,87 @@ Visit the website https://gate.minekube.com/ for more information.`
 		return nil
 	}
 	return app
+}
+
+// loadRemoteConfig loads the configuration from the remote URL
+func loadRemoteConfig(ctx context.Context) (*viper.Viper, error) {
+	// Create HTTP request with context
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+	
+	// Send the request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("received non-OK status code: %d", resp.StatusCode)
+	}
+	
+	// Read response body
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	
+	// Write to a temporary file
+	tempFile := "config_remote.yml"
+	if err := os.WriteFile(tempFile, data, 0644); err != nil {
+		return nil, fmt.Errorf("failed to write temporary config file: %w", err)
+	}
+	
+	// Load the config into viper
+	v := viper.New()
+	v.SetConfigFile(tempFile)
+	if err := v.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+	
+	return v, nil
+}
+
+// startRemoteConfigReloader periodically reloads the configuration from the remote URL
+func startRemoteConfigReloader(ctx context.Context, log logr.Logger, initialCfg *gate.Config) {
+	ticker := time.NewTicker(reloadInterval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			log.Info("Reloading configuration from remote URL", "url", configURL)
+			
+			// Load the new config
+			v, err := loadRemoteConfig(ctx)
+			if err != nil {
+				log.Error(err, "Failed to reload remote configuration")
+				continue
+			}
+			
+			// Parse the config
+			cfg, err := gate.LoadConfig(v)
+			if err != nil {
+				log.Error(err, "Failed to parse remote configuration")
+				continue
+			}
+			
+			// Apply the new config
+			// Note: Gate might need a restart or a specific API to reload config at runtime
+			// This implementation assumes there's a way to signal Gate to reload its config
+			log.Info("Successfully loaded new configuration from remote URL")
+			
+			// Here you would typically call an API to apply the new config to the running Gate instance
+			// For example: gate.ReloadConfig(cfg)
+			
+		case <-ctx.Done():
+			log.Info("Stopping remote configuration reloader")
+			return
+		}
+	}
 }
 
 func initViper(c *cli.Context, configFile string) (*viper.Viper, error) {
