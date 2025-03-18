@@ -3,7 +3,7 @@ package main
 import (
 	"go.minekube.com/gate/cmd/gate"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
-	"./plugins/ipblacklist" // lokaler Import deines Plugins
+	"go.minekube.com/gate/pkg/plugins/ipblacklist"
 )
 
 func main() {
