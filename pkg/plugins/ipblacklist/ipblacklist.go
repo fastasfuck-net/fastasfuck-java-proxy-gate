@@ -45,9 +45,13 @@ var Plugin = proxy.Plugin{
 		// Starte den Update-Prozess im Hintergrund
 		go plugin.startBlacklistUpdater(ctx)
 
-		// Registriere den Event-Handler für eingehende Verbindungen
-		// Nutze die korrekte API für die Event-Registrierung
-		event.Subscribe(p.Event(), 0, plugin.handleInbound)
+		// Registriere verschiedene Event-Handler für verschiedene Ereignisse
+		// Das sollte sicherstellen, dass wir den richtigen Event-Typ erwischen
+		event.Subscribe(p.Event(), event.LowestPriority, plugin.handleEvent) // Generischer Handler für alle Events
+
+		// Explizit wichtige Events für Verbindungen registrieren
+		p.Event().Subscribe(&proxy.PreLoginEvent{}, plugin.handlePreLogin)
+		p.Event().Subscribe(&proxy.LoginEvent{}, plugin.handleLogin)
 
 		log.Info("IP Blacklist Plugin erfolgreich initialisiert!", 
 			"blacklistURL", plugin.blacklistURL,
@@ -72,39 +76,98 @@ type BlacklistEntry struct {
 	IP string `json:"ip"`
 }
 
-// handleInbound wird aufgerufen, wenn ein Spieler versucht, sich zu verbinden
-func (p *blacklistPlugin) handleInbound(e event.Event) {
-	// Typumwandlung zum korrekten Event-Typ
+// handleEvent ist ein generischer Handler, der auf alle Events reagiert
+// und versucht, IP-Adressen aus allen möglichen Ereignissen zu extrahieren
+func (p *blacklistPlugin) handleEvent(e event.Event) {
+	// Zeige den genauen Event-Typ an, um zu debuggen
+	p.log.V(3).Info("Event erhalten", "type", event.TypeOf(e))
+
+	var ipAddr string
+	var playerToDisconnect interface {
+		Disconnect(reason interface{})
+	}
+
+	// Versuche, verschiedene Event-Typen zu erkennen
+	switch evt := e.(type) {
+	case *proxy.LoginEvent:
+		if player := evt.Player(); player != nil {
+			ipAddr = extractIP(player.RemoteAddr())
+			playerToDisconnect = player
+		}
+	case *proxy.PreLoginEvent:
+		if conn := evt.Connection(); conn != nil {
+			ipAddr = extractIP(conn.RemoteAddr())
+			// Für PreLoginEvent verwenden wir die Deny-Methode statt Disconnect
+		}
+	case *proxy.ServerConnectedEvent:
+		if player := evt.Player(); player != nil {
+			ipAddr = extractIP(player.RemoteAddr())
+			playerToDisconnect = player
+		}
+	}
+
+	// Wenn wir eine IP gefunden haben, prüfen wir, ob sie blockiert werden sollte
+	if ipAddr != "" && p.isBlocked(ipAddr) {
+		p.log.Info("Verbindung von geblockter IP erkannt", "ip", ipAddr, "eventType", event.TypeOf(e))
+		
+		if playerToDisconnect != nil {
+			// Ablehnen der Verbindung mit einer Nachricht
+			disconnectMessage := &c.Text{
+				Content: p.blockMessage,
+			}
+			playerToDisconnect.Disconnect(disconnectMessage)
+		}
+	}
+}
+
+// handlePreLogin behandelt speziell PreLoginEvents
+func (p *blacklistPlugin) handlePreLogin(e event.Event) {
+	preLoginEvent, ok := e.(*proxy.PreLoginEvent)
+	if !ok {
+		return // Falscher Event-Typ
+	}
+
+	conn := preLoginEvent.Connection()
+	if conn == nil {
+		return
+	}
+
+	ipAddr := extractIP(conn.RemoteAddr())
+	if ipAddr == "" {
+		return
+	}
+
+	if p.isBlocked(ipAddr) {
+		p.log.Info("Verbindung von geblockter IP im PreLogin abgelehnt", "ip", ipAddr)
+		
+		// In PreLogin müssen wir einen anderen Mechanismus verwenden
+		disconnectMsg := &c.Text{Content: p.blockMessage}
+		preLoginEvent.Deny(disconnectMsg)
+	}
+}
+
+// handleLogin behandelt speziell LoginEvents
+func (p *blacklistPlugin) handleLogin(e event.Event) {
 	loginEvent, ok := e.(*proxy.LoginEvent)
 	if !ok {
-		p.log.Error(nil, "Falscher Event-Typ erhalten", "type", e)
-		return
+		return // Falscher Event-Typ
 	}
 
 	player := loginEvent.Player()
 	if player == nil {
-		p.log.Error(nil, "Kein Spieler im LoginEvent")
 		return
 	}
 
-	// Extrahiere die IP-Adresse
 	ipAddr := extractIP(player.RemoteAddr())
 	if ipAddr == "" {
-		p.log.Error(nil, "Konnte IP-Adresse nicht extrahieren", "addr", player.RemoteAddr())
 		return
 	}
 
-	// Prüfe, ob die IP in der Blacklist ist
 	if p.isBlocked(ipAddr) {
-		p.log.Info("Verbindung von geblockter IP abgelehnt", "ip", ipAddr)
-
-		// Ablehnen der Verbindung mit einer Nachricht
-		disconnectMessage := &c.Text{
-			Content: p.blockMessage,
-		}
-
-		// Die Disconnect-Methode wird aufgerufen, um die Verbindung zu trennen
-		player.Disconnect(disconnectMessage)
+		p.log.Info("Verbindung von geblockter IP im Login abgelehnt", "ip", ipAddr)
+		
+		disconnectMsg := &c.Text{Content: p.blockMessage}
+		player.Disconnect(disconnectMsg)
 	}
 }
 
@@ -153,6 +216,11 @@ func (p *blacklistPlugin) isBlocked(ipStr string) bool {
 		return false
 	}
 
+	// Lokale und private IPs nicht blockieren
+	if ip.IsLoopback() || isPrivateIP(ip) {
+		return false
+	}
+
 	p.blacklistMutex.RLock()
 	defer p.blacklistMutex.RUnlock()
 
@@ -165,6 +233,43 @@ func (p *blacklistPlugin) isBlocked(ipStr string) bool {
 	for _, cidr := range p.blacklistCIDR {
 		if cidr.Contains(ip) {
 			return true
+		}
+	}
+
+	return false
+}
+
+// isPrivateIP prüft, ob eine IP-Adresse im privaten Bereich liegt
+func isPrivateIP(ip net.IP) bool {
+	// Private IPv4 Bereiche
+	privateIPv4Blocks := []string{
+		"10.0.0.0/8",     // RFC1918
+		"172.16.0.0/12",  // RFC1918
+		"192.168.0.0/16", // RFC1918
+		"127.0.0.0/8",    // Localhost
+	}
+
+	// Private IPv6 Bereiche
+	privateIPv6Blocks := []string{
+		"fc00::/7",   // Unique-Local
+		"fe80::/10",  // Link-Local
+		"::1/128",    // Localhost
+	}
+
+	// Prüfe IPv4
+	if ip.To4() != nil {
+		for _, block := range privateIPv4Blocks {
+			_, cidr, err := net.ParseCIDR(block)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+	} else { // Prüfe IPv6
+		for _, block := range privateIPv6Blocks {
+			_, cidr, err := net.ParseCIDR(block)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
 		}
 	}
 
