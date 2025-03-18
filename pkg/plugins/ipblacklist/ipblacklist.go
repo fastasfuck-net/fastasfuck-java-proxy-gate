@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +36,8 @@ var Plugin = proxy.Plugin{
 		go plugin.startBlacklistUpdater(ctx)
 
 		// Registriere den Event-Handler für eingehende Verbindungen
-		event.Subscribe(p.Event(), 0, plugin.handleInbound)
+		// Korrigiert: Übergebe den korrekten Event-Typ
+		event.Subscribe(p.Event(), proxy.LoginEvent{}, plugin.handleInbound)
 
 		log.Info("IP Blacklist Plugin erfolgreich initialisiert!")
 		return nil
@@ -61,7 +61,14 @@ type BlacklistEntry struct {
 func (p *blacklistPlugin) handleInbound(e *proxy.LoginEvent) {
 	// Extrahiere die IP-Adresse aus der Verbindung
 	addr := e.Player().RemoteAddr().String()
-	ip := strings.Split(addr, ":")[0] // Entferne den Port
+	
+	// Verbesserte IP-Extraktion mit Unterstützung für IPv6
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		p.log.Error(err, "Fehler beim Extrahieren der IP-Adresse", "addr", addr)
+		return
+	}
+	ip := host
 
 	// Prüfe, ob die IP in der Blacklist ist
 	p.blacklistMutex.RLock()
@@ -76,7 +83,7 @@ func (p *blacklistPlugin) handleInbound(e *proxy.LoginEvent) {
 			Content: "You are on the global blacklist of fastasfuck.net\nTo appeal go to appeal.fastasfuck.net",
 		}
 
-		// Korrigiert: Die Disconnect-Methode gibt keinen Wert zurück
+		// Die Disconnect-Methode wird aufgerufen, um die Verbindung zu trennen
 		e.Player().Disconnect(disconnectMessage)
 	}
 }
@@ -105,17 +112,20 @@ func (p *blacklistPlugin) startBlacklistUpdater(ctx context.Context) {
 func (p *blacklistPlugin) updateBlacklist() {
 	p.log.Info("Aktualisiere IP-Blacklist...", "url", p.blacklistURL)
 
-	// HTTP-Anfrage an die Blacklist-URL
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// HTTP-Anfrage an die Blacklist-URL mit Kontext und Timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	req, err := http.NewRequest("GET", p.blacklistURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", p.blacklistURL, nil)
 	if err != nil {
 		p.log.Error(err, "Fehler beim Erstellen der HTTP-Anfrage")
 		return
 	}
 
+	// User-Agent setzen, um höflich zu sein
+	req.Header.Set("User-Agent", "IPBlacklist-Plugin/1.0")
+
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		p.log.Error(err, "Fehler beim Abrufen der Blacklist")
@@ -128,8 +138,8 @@ func (p *blacklistPlugin) updateBlacklist() {
 		return
 	}
 
-	// Lese den Response-Body
-	body, err := io.ReadAll(resp.Body)
+	// Lese den Response-Body mit Größenbeschränkung
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // Max 10MB
 	if err != nil {
 		p.log.Error(err, "Fehler beim Lesen der Blacklist-Antwort")
 		return
@@ -144,11 +154,16 @@ func (p *blacklistPlugin) updateBlacklist() {
 
 	// Aktualisiere die Blacklist
 	newBlacklist := make(map[string]bool, len(entries))
+	validCount := 0
+	invalidCount := 0
+
 	for _, entry := range entries {
 		// Validiere die IP-Adresse
 		if net.ParseIP(entry.IP) != nil {
 			newBlacklist[entry.IP] = true
+			validCount++
 		} else {
+			invalidCount++
 			p.log.Info("Ungültige IP-Adresse in der Blacklist ignoriert", "ip", entry.IP)
 		}
 	}
@@ -158,5 +173,8 @@ func (p *blacklistPlugin) updateBlacklist() {
 	p.blacklist = newBlacklist
 	p.blacklistMutex.Unlock()
 
-	p.log.Info("IP-Blacklist erfolgreich aktualisiert", "count", len(newBlacklist))
+	p.log.Info("IP-Blacklist erfolgreich aktualisiert", 
+		"validCount", validCount, 
+		"invalidCount", invalidCount,
+		"totalCount", len(newBlacklist))
 }
