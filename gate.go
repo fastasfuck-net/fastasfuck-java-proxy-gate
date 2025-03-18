@@ -4,14 +4,16 @@ import (
 	"go.minekube.com/gate/cmd/gate"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 	"go.minekube.com/gate/pkg/plugins/ipblacklist"
+	"go.minekube.com/gate/pkg/plugins/remoteconfig" // Add this import for our new plugin
 )
 
-func init() {
-	// Plugin vor dem Start registrieren
-	proxy.Plugins = append(proxy.Plugins, ipblacklist.Plugin)
-}
-
 func main() {
-	// Gate starten
+	// Register plugins
+	proxy.Plugins = append(proxy.Plugins,
+		ipblacklist.Plugin,
+		remoteconfig.Plugin, // Add our remote config plugin
+	)
+	
+	// Start Gate
 	gate.Execute()
 }
