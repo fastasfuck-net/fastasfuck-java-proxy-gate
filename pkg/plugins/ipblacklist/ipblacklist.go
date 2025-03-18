@@ -36,8 +36,8 @@ var Plugin = proxy.Plugin{
 		go plugin.startBlacklistUpdater(ctx)
 
 		// Registriere den Event-Handler für eingehende Verbindungen
-		// Korrigiert: Übergebe den korrekten Event-Typ
-		event.Subscribe(p.Event(), proxy.LoginEvent{}, plugin.handleInbound)
+		// Der zweite Parameter ist die Priorität (int), nicht der Event-Typ
+		event.Subscribe(p.Event(), 0, plugin.handleInbound)
 
 		log.Info("IP Blacklist Plugin erfolgreich initialisiert!")
 		return nil
