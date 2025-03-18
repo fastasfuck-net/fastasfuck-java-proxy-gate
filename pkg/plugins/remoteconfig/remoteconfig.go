@@ -6,17 +6,18 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/viper"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
-	"go.minekube.com/gate/pkg/gate"
 )
 
 const (
 	configURL      = "https://manager.fastasfuck.net/config/raw"
 	reloadInterval = 5 * time.Minute
+	configFilePath = "config_remote.yml" // Path where the remote config will be saved
 )
 
 // Plugin is the remote config loader plugin.
@@ -31,18 +32,18 @@ func Init(ctx context.Context, proxy *proxy.Proxy) error {
 	logger.Info("Initializing remote configuration loader plugin")
 
 	// Get initial configuration
-	if err := loadRemoteConfig(ctx, proxy); err != nil {
+	if err := loadRemoteConfig(ctx); err != nil {
 		logger.Error(err, "Failed to load initial remote configuration")
 		// Continue anyway, using local config
 	}
 
 	// Start background periodic reload
-	go periodicConfigReload(ctx, proxy)
+	go periodicConfigReload(ctx)
 
 	return nil
 }
 
-func periodicConfigReload(ctx context.Context, proxy *proxy.Proxy) {
+func periodicConfigReload(ctx context.Context) {
 	logger := logr.FromContextOrDiscard(ctx)
 	ticker := time.NewTicker(reloadInterval)
 	defer ticker.Stop()
@@ -51,7 +52,7 @@ func periodicConfigReload(ctx context.Context, proxy *proxy.Proxy) {
 		select {
 		case <-ticker.C:
 			// Reload config from remote URL
-			if err := loadRemoteConfig(ctx, proxy); err != nil {
+			if err := loadRemoteConfig(ctx); err != nil {
 				logger.Error(err, "Failed to reload remote configuration")
 				continue
 			}
@@ -63,7 +64,7 @@ func periodicConfigReload(ctx context.Context, proxy *proxy.Proxy) {
 	}
 }
 
-func loadRemoteConfig(ctx context.Context, proxy *proxy.Proxy) error {
+func loadRemoteConfig(ctx context.Context) error {
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.Info("Loading configuration from remote URL", "url", configURL)
 
@@ -91,31 +92,18 @@ func loadRemoteConfig(ctx context.Context, proxy *proxy.Proxy) error {
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Write to a temporary file
-	tempFile := "config_remote.yml"
-	if err := os.WriteFile(tempFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write temporary config file: %w", err)
-	}
-
-	// Load the config into viper
+	// Validate the config by attempting to load it in viper
 	v := viper.New()
-	v.SetConfigFile(tempFile)
-	if err := v.ReadInConfig(); err != nil {
-		return fmt.Errorf("failed to read config file: %w", err)
+	v.SetConfigType("yaml") // Specify that it's YAML format
+	if err := v.ReadConfig(strings.NewReader(string(data))); err != nil {
+		return fmt.Errorf("invalid configuration format: %w", err)
 	}
 
-	// Load the new config
-	cfg, err := gate.LoadConfig(v)
-	if err != nil {
-		return fmt.Errorf("failed to load config from viper: %w", err)
+	// Write to the config file
+	if err := os.WriteFile(configFilePath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
-	// Apply the new config to the proxy
-	// Note: This depends on Gate's internal mechanisms and may need adjustment
-	if err := proxy.ApplyConfig(*cfg); err != nil {
-		return fmt.Errorf("failed to apply new configuration: %w", err)
-	}
-
-	logger.Info("Successfully applied remote configuration")
+	logger.Info("Successfully saved remote configuration to file", "path", configFilePath)
 	return nil
 }
