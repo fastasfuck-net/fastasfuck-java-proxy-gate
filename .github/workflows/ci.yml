@@ -6,7 +6,7 @@ on:
 
 # Add this permissions block to fix the 403 Forbidden error
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
