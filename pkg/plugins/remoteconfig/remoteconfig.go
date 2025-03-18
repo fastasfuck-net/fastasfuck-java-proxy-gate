@@ -29,13 +29,8 @@ var Plugin = proxy.Plugin{
 
 // Init initializes the remote configuration plugin
 func Init(ctx context.Context, proxy *proxy.Proxy) error {
-	// Extract logger from context or create a new one
-	log, ok := logr.FromContext(ctx)
-	if !ok {
-		// If no logger in context, create a new one
-		log = logr.Discard()
-	}
-	log = log.WithName("remoteconfig")
+	// Get logger from context
+	log := logr.FromContext(ctx).WithName("remoteconfig")
 	
 	// Create a temporary directory that will be writable
 	tempDir, err := os.MkdirTemp("", "gate-config")
@@ -90,11 +85,8 @@ func loadConfig(configPath string, log logr.Logger) error {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 	
-	// Notify Gate about config change
-	if err := configutil.ReloadConfig(configPath); err != nil {
-		log.Error(err, "Failed to reload config from remote source")
-		return err
-	}
+	// Gate will automatically detect the file change and reload
+	log.Info("Config file updated, Gate should detect the change automatically")
 	
 	log.Info("Successfully loaded configuration from remote URL", "url", configURL)
 	return nil
