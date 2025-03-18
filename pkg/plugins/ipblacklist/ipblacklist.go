@@ -4,6 +4,7 @@ package ipblacklist
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -30,6 +31,7 @@ var Plugin = proxy.Plugin{
 			log:            log,
 			blacklist:      make(map[string]bool),
 			blacklistCIDR:  make([]*net.IPNet, 0),
+			proxy:          p,
 			// HIER EINSTELLUNGEN ANPASSEN:
 			blacklistURL:   "https://fastasfuck.net/blacklist.json", // URL zur Blacklist
 			updateInterval: 5 * time.Minute,                         // Update-Intervall
@@ -45,13 +47,13 @@ var Plugin = proxy.Plugin{
 		// Starte den Update-Prozess im Hintergrund
 		go plugin.startBlacklistUpdater(ctx)
 
-		// Registriere verschiedene Event-Handler für verschiedene Ereignisse
-		// Das sollte sicherstellen, dass wir den richtigen Event-Typ erwischen
-		event.Subscribe(p.Event(), event.LowestPriority, plugin.handleEvent) // Generischer Handler für alle Events
-
-		// Explizit wichtige Events für Verbindungen registrieren
-		p.Event().Subscribe(&proxy.PreLoginEvent{}, plugin.handlePreLogin)
-		p.Event().Subscribe(&proxy.LoginEvent{}, plugin.handleLogin)
+		// Registriere den Event-Handler für LoginEvents
+		// Verwende hier die korrekte Syntax für die Event-Registrierung
+		event.Subscribe(p.Event(), 0, func(e event.Event) {
+			if loginEvent, ok := e.(*proxy.LoginEvent); ok {
+				plugin.handleLogin(loginEvent)
+			}
+		})
 
 		log.Info("IP Blacklist Plugin erfolgreich initialisiert!", 
 			"blacklistURL", plugin.blacklistURL,
@@ -69,6 +71,7 @@ type blacklistPlugin struct {
 	updateInterval time.Duration
 	blockMessage   string
 	enabled        bool
+	proxy          *proxy.Proxy
 }
 
 // BlacklistEntry repräsentiert einen Eintrag in der Blacklist
@@ -76,98 +79,32 @@ type BlacklistEntry struct {
 	IP string `json:"ip"`
 }
 
-// handleEvent ist ein generischer Handler, der auf alle Events reagiert
-// und versucht, IP-Adressen aus allen möglichen Ereignissen zu extrahieren
-func (p *blacklistPlugin) handleEvent(e event.Event) {
-	// Zeige den genauen Event-Typ an, um zu debuggen
-	p.log.V(3).Info("Event erhalten", "type", event.TypeOf(e))
-
-	var ipAddr string
-	var playerToDisconnect interface {
-		Disconnect(reason interface{})
-	}
-
-	// Versuche, verschiedene Event-Typen zu erkennen
-	switch evt := e.(type) {
-	case *proxy.LoginEvent:
-		if player := evt.Player(); player != nil {
-			ipAddr = extractIP(player.RemoteAddr())
-			playerToDisconnect = player
-		}
-	case *proxy.PreLoginEvent:
-		if conn := evt.Connection(); conn != nil {
-			ipAddr = extractIP(conn.RemoteAddr())
-			// Für PreLoginEvent verwenden wir die Deny-Methode statt Disconnect
-		}
-	case *proxy.ServerConnectedEvent:
-		if player := evt.Player(); player != nil {
-			ipAddr = extractIP(player.RemoteAddr())
-			playerToDisconnect = player
-		}
-	}
-
-	// Wenn wir eine IP gefunden haben, prüfen wir, ob sie blockiert werden sollte
-	if ipAddr != "" && p.isBlocked(ipAddr) {
-		p.log.Info("Verbindung von geblockter IP erkannt", "ip", ipAddr, "eventType", event.TypeOf(e))
-		
-		if playerToDisconnect != nil {
-			// Ablehnen der Verbindung mit einer Nachricht
-			disconnectMessage := &c.Text{
-				Content: p.blockMessage,
-			}
-			playerToDisconnect.Disconnect(disconnectMessage)
-		}
-	}
-}
-
-// handlePreLogin behandelt speziell PreLoginEvents
-func (p *blacklistPlugin) handlePreLogin(e event.Event) {
-	preLoginEvent, ok := e.(*proxy.PreLoginEvent)
-	if !ok {
-		return // Falscher Event-Typ
-	}
-
-	conn := preLoginEvent.Connection()
-	if conn == nil {
-		return
-	}
-
-	ipAddr := extractIP(conn.RemoteAddr())
-	if ipAddr == "" {
-		return
-	}
-
-	if p.isBlocked(ipAddr) {
-		p.log.Info("Verbindung von geblockter IP im PreLogin abgelehnt", "ip", ipAddr)
-		
-		// In PreLogin müssen wir einen anderen Mechanismus verwenden
-		disconnectMsg := &c.Text{Content: p.blockMessage}
-		preLoginEvent.Deny(disconnectMsg)
-	}
-}
-
-// handleLogin behandelt speziell LoginEvents
-func (p *blacklistPlugin) handleLogin(e event.Event) {
-	loginEvent, ok := e.(*proxy.LoginEvent)
-	if !ok {
-		return // Falscher Event-Typ
-	}
-
-	player := loginEvent.Player()
+// handleLogin wird aufgerufen, wenn ein Spieler versucht, sich zu verbinden
+func (p *blacklistPlugin) handleLogin(e *proxy.LoginEvent) {
+	player := e.Player()
 	if player == nil {
+		p.log.Error(nil, "Kein Spieler im LoginEvent")
 		return
 	}
 
+	// Extrahiere die IP-Adresse
 	ipAddr := extractIP(player.RemoteAddr())
 	if ipAddr == "" {
+		p.log.Error(nil, "Konnte IP-Adresse nicht extrahieren", "addr", player.RemoteAddr())
 		return
 	}
 
+	// Prüfe, ob die IP in der Blacklist ist
 	if p.isBlocked(ipAddr) {
-		p.log.Info("Verbindung von geblockter IP im Login abgelehnt", "ip", ipAddr)
-		
-		disconnectMsg := &c.Text{Content: p.blockMessage}
-		player.Disconnect(disconnectMsg)
+		p.log.Info("Verbindung von geblockter IP abgelehnt", "ip", ipAddr)
+
+		// Ablehnen der Verbindung mit einer Nachricht
+		disconnectMessage := &c.Text{
+			Content: p.blockMessage,
+		}
+
+		// Die Disconnect-Methode wird aufgerufen, um die Verbindung zu trennen
+		player.Disconnect(disconnectMessage)
 	}
 }
 
@@ -279,7 +216,9 @@ func isPrivateIP(ip net.IP) bool {
 // startBlacklistUpdater startet einen Goroutine, der die Blacklist regelmäßig aktualisiert
 func (p *blacklistPlugin) startBlacklistUpdater(ctx context.Context) {
 	// Sofort beim Start aktualisieren
-	p.updateBlacklist()
+	if err := p.updateBlacklist(); err != nil {
+		p.log.Error(err, "Initialer Blacklist-Update fehlgeschlagen")
+	}
 
 	// Dann regelmäßig aktualisieren
 	ticker := time.NewTicker(p.updateInterval)
@@ -288,7 +227,9 @@ func (p *blacklistPlugin) startBlacklistUpdater(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			p.updateBlacklist()
+			if err := p.updateBlacklist(); err != nil {
+				p.log.Error(err, "Blacklist-Update fehlgeschlagen")
+			}
 		case <-ctx.Done():
 			p.log.Info("Blacklist Updater beendet")
 			return
@@ -297,7 +238,7 @@ func (p *blacklistPlugin) startBlacklistUpdater(ctx context.Context) {
 }
 
 // updateBlacklist lädt die aktuelle Blacklist von der konfigurierten URL
-func (p *blacklistPlugin) updateBlacklist() {
+func (p *blacklistPlugin) updateBlacklist() error {
 	p.log.Info("Aktualisiere IP-Blacklist...", "url", p.blacklistURL)
 
 	// HTTP-Anfrage an die Blacklist-URL mit Kontext und Timeout
@@ -306,8 +247,7 @@ func (p *blacklistPlugin) updateBlacklist() {
 
 	req, err := http.NewRequestWithContext(ctx, "GET", p.blacklistURL, nil)
 	if err != nil {
-		p.log.Error(err, "Fehler beim Erstellen der HTTP-Anfrage")
-		return
+		return fmt.Errorf("fehler beim Erstellen der HTTP-Anfrage: %w", err)
 	}
 
 	// User-Agent setzen, um höflich zu sein
@@ -318,27 +258,22 @@ func (p *blacklistPlugin) updateBlacklist() {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		p.log.Error(err, "Fehler beim Abrufen der Blacklist")
-		return
+		return fmt.Errorf("fehler beim Abrufen der Blacklist: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		p.log.Error(nil, "Unerwarteter Status-Code beim Abrufen der Blacklist", "statusCode", resp.StatusCode)
-		return
+		return fmt.Errorf("unerwarteter Status-Code beim Abrufen der Blacklist: %d", resp.StatusCode)
 	}
 
 	// Lese den Response-Body mit Größenbeschränkung
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // Max 10MB
 	if err != nil {
-		p.log.Error(err, "Fehler beim Lesen der Blacklist-Antwort")
-		return
+		return fmt.Errorf("fehler beim Lesen der Blacklist-Antwort: %w", err)
 	}
 
 	// Versuche verschiedene Formate zu parsen
-	if err := p.parseBlacklist(body); err != nil {
-		p.log.Error(err, "Fehler beim Parsen der Blacklist")
-	}
+	return p.parseBlacklist(body)
 }
 
 // parseBlacklist versucht, die Blacklist in verschiedenen Formaten zu parsen
@@ -372,7 +307,7 @@ func (p *blacklistPlugin) parseBlacklist(data []byte) error {
 		return nil
 	}
 
-	return nil
+	return fmt.Errorf("konnte Blacklist nicht parsen")
 }
 
 // processEntries verarbeitet die geparsten Blacklist-Einträge
