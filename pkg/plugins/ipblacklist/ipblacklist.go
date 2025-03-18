@@ -89,14 +89,28 @@ func (p *blacklistPlugin) handleLogin(e *proxy.LoginEvent) {
 
 	// Extrahiere die IP-Adresse
 	ipAddr := extractIP(player.RemoteAddr())
+	
+	// Zeige IP-Adresse und Spielername in der Konsole an
+	playerName := player.Username()
 	if ipAddr == "" {
-		p.log.Error(nil, "Konnte IP-Adresse nicht extrahieren", "addr", player.RemoteAddr())
+		p.log.Info("Spieler verbunden - IP konnte nicht extrahiert werden", 
+			"spieler", playerName, 
+			"addr", player.RemoteAddr())
+	} else {
+		// Zeige die IP-Adresse deutlich in der Konsole an
+		p.log.Info("Spieler verbunden", 
+			"spieler", playerName, 
+			"ip", ipAddr)
+	}
+
+	// Wenn keine IP extrahiert werden konnte, brechen wir hier ab
+	if ipAddr == "" {
 		return
 	}
 
 	// Prüfe, ob die IP in der Blacklist ist
 	if p.isBlocked(ipAddr) {
-		p.log.Info("Verbindung von geblockter IP abgelehnt", "ip", ipAddr)
+		p.log.Info("Verbindung von geblockter IP abgelehnt", "ip", ipAddr, "spieler", playerName)
 
 		// Ablehnen der Verbindung mit einer Nachricht
 		disconnectMessage := &c.Text{
