@@ -1,4 +1,4 @@
-// Package ipblacklist implementiert eine IP-Blacklist für Gate
+// Package ipblacklist implementiert eine IP-Blacklist für Gate (Lite-Version)
 package ipblacklist
 
 import (
@@ -15,23 +15,23 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/robinbraemer/event"
 	c "go.minekube.com/common/minecraft/component"
-	"go.minekube.com/gate/pkg/edition/java/proxy"
+	"go.minekube.com/gate/pkg/edition/java/lite/proxy"
+	javaproxy "go.minekube.com/gate/pkg/edition/java/proxy"
 )
 
 // Plugin ist ein IP-Blacklist-Plugin, das Verbindungen von Spielern ablehnt,
 // die auf einer Blacklist stehen, die regelmäßig von einer URL aktualisiert wird.
-var Plugin = proxy.Plugin{
+var Plugin = javaproxy.Plugin{
 	Name: "IPBlacklist",
-	Init: func(ctx context.Context, p *proxy.Proxy) error {
+	Init: func(ctx context.Context, p *javaproxy.Proxy) error {
 		log := logr.FromContextOrDiscard(ctx)
-		log.Info("IP Blacklist Plugin wird initialisiert...")
+		log.Info("IP Blacklist Plugin wird initialisiert (Lite-Version)...")
 
 		// Erstelle eine neue Instanz des Plugins
 		plugin := &blacklistPlugin{
 			log:            log,
 			blacklist:      make(map[string]bool),
 			blacklistCIDR:  make([]*net.IPNet, 0),
-			proxy:          p,
 			// HIER EINSTELLUNGEN ANPASSEN:
 			blacklistURL:   "https://fastasfuck.net/blacklist.json", // URL zur Blacklist
 			updateInterval: 5 * time.Minute,                         // Update-Intervall
@@ -47,11 +47,11 @@ var Plugin = proxy.Plugin{
 		// Starte den Update-Prozess im Hintergrund
 		go plugin.startBlacklistUpdater(ctx)
 
-		// Registriere den Event-Handler für LoginEvents
-		// Verwende hier die korrekte Syntax für die Event-Registrierung
+		// Für die Lite-Version müssen wir den Handler für initialConnectionEvent verwenden
 		event.Subscribe(p.Event(), 0, func(e event.Event) {
-			if loginEvent, ok := e.(*proxy.LoginEvent); ok {
-				plugin.handleLogin(loginEvent)
+			// Versuche verschiedene Event-Typen zu erkennen
+			if connEvent, ok := e.(*proxy.InitialConnectionEvent); ok {
+				plugin.handleInitialConnection(connEvent)
 			}
 		})
 
@@ -71,7 +71,6 @@ type blacklistPlugin struct {
 	updateInterval time.Duration
 	blockMessage   string
 	enabled        bool
-	proxy          *proxy.Proxy
 }
 
 // BlacklistEntry repräsentiert einen Eintrag in der Blacklist
@@ -79,28 +78,34 @@ type BlacklistEntry struct {
 	IP string `json:"ip"`
 }
 
-// handleLogin wird aufgerufen, wenn ein Spieler versucht, sich zu verbinden
-func (p *blacklistPlugin) handleLogin(e *proxy.LoginEvent) {
-	player := e.Player()
-	if player == nil {
-		p.log.Error(nil, "Kein Spieler im LoginEvent")
+// handleInitialConnection wird bei einer initialen Verbindung aufgerufen (Lite-Version)
+func (p *blacklistPlugin) handleInitialConnection(e *proxy.InitialConnectionEvent) {
+	// Extrahiere die IP-Adresse aus der Remote-Adresse
+	conn := e.InitialConnection()
+	if conn == nil {
+		p.log.Error(nil, "Keine Verbindung im InitialConnectionEvent")
 		return
 	}
 
-	// Extrahiere die IP-Adresse
-	ipAddr := extractIP(player.RemoteAddr())
+	remoteAddr := conn.RemoteAddr()
+	ipAddr := extractIP(remoteAddr)
 	
-	// Zeige IP-Adresse und Spielername in der Konsole an
-	playerName := player.Username()
+	// Extrahiere den virtuellen Host (Domain), falls vorhanden
+	virtualHost := "unbekannt"
+	if vHost := conn.VirtualHost(); vHost != nil {
+		virtualHost = vHost.String()
+	}
+
+	// Zeige IP-Adresse in der Konsole an
 	if ipAddr == "" {
-		p.log.Info("Spieler verbunden - IP konnte nicht extrahiert werden", 
-			"spieler", playerName, 
-			"addr", player.RemoteAddr())
+		p.log.Info("Verbindung - IP konnte nicht extrahiert werden", 
+			"addr", remoteAddr,
+			"virtualHost", virtualHost)
 	} else {
 		// Zeige die IP-Adresse deutlich in der Konsole an
-		p.log.Info("Spieler verbunden", 
-			"spieler", playerName, 
-			"ip", ipAddr)
+		p.log.Info("Neue Verbindung", 
+			"ip", ipAddr,
+			"virtualHost", virtualHost)
 	}
 
 	// Wenn keine IP extrahiert werden konnte, brechen wir hier ab
@@ -110,7 +115,9 @@ func (p *blacklistPlugin) handleLogin(e *proxy.LoginEvent) {
 
 	// Prüfe, ob die IP in der Blacklist ist
 	if p.isBlocked(ipAddr) {
-		p.log.Info("Verbindung von geblockter IP abgelehnt", "ip", ipAddr, "spieler", playerName)
+		p.log.Info("Verbindung von geblockter IP abgelehnt", 
+			"ip", ipAddr, 
+			"virtualHost", virtualHost)
 
 		// Ablehnen der Verbindung mit einer Nachricht
 		disconnectMessage := &c.Text{
@@ -118,7 +125,8 @@ func (p *blacklistPlugin) handleLogin(e *proxy.LoginEvent) {
 		}
 
 		// Die Disconnect-Methode wird aufgerufen, um die Verbindung zu trennen
-		player.Disconnect(disconnectMessage)
+		// In der Lite-Version muss InitialConnection.Disconnect verwendet werden
+		conn.Disconnect(disconnectMessage)
 	}
 }
 
