@@ -4,7 +4,7 @@ import (
 	"go.minekube.com/gate/cmd/gate"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 	"go.minekube.com/gate/pkg/plugins/ipblacklist"
-	"go.minekube.com/gate/pkg/plugins/remoteconfig" // Add this import for our new plugin
+	"go.minekube.com/gate/pkg/plugins/remoteconfig" // Import our new plugin
 )
 
 func main() {
