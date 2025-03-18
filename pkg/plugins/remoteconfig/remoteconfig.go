@@ -12,7 +12,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
-	"go.minekube.com/gate/pkg/util/configutil"
 )
 
 const (
@@ -29,8 +28,8 @@ var Plugin = proxy.Plugin{
 
 // Init initializes the remote configuration plugin
 func Init(ctx context.Context, proxy *proxy.Proxy) error {
-	// Get logger from context
-	log := logr.FromContext(ctx).WithName("remoteconfig")
+	// Create a logger
+	log := logr.Discard().WithName("remoteconfig")
 	
 	// Create a temporary directory that will be writable
 	tempDir, err := os.MkdirTemp("", "gate-config")
