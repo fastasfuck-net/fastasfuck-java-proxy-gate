@@ -1,15 +1,15 @@
 package gate
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"strings"
 	"time"
-	"io"
-	"net/http"
-	"context"
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
@@ -44,9 +44,9 @@ func App() *cli.App {
 Visit the website https://gate.minekube.com/ for more information.`
 
 	var (
-		debug      bool
-		configFile string
-		verbosity  int
+		debug          bool
+		configFile     string
+		verbosity      int
 		useRemoteConfig bool
 	)
 	app.Flags = []cli.Flag{
@@ -132,7 +132,7 @@ Visit the website https://gate.minekube.com/ for more information.`
 		
 		// If remote config is used, start the background reloader
 		if useRemoteConfig {
-			go startRemoteConfigReloader(c.Context, log, cfg)
+			go startRemoteConfigReloader(c.Context, log)
 		}
 
 		// Start Gate
@@ -190,7 +190,7 @@ func loadRemoteConfig(ctx context.Context) (*viper.Viper, error) {
 }
 
 // startRemoteConfigReloader periodically reloads the configuration from the remote URL
-func startRemoteConfigReloader(ctx context.Context, log logr.Logger, initialCfg *gate.Config) {
+func startRemoteConfigReloader(ctx context.Context, log logr.Logger) {
 	ticker := time.NewTicker(reloadInterval)
 	defer ticker.Stop()
 	
@@ -200,26 +200,14 @@ func startRemoteConfigReloader(ctx context.Context, log logr.Logger, initialCfg 
 			log.Info("Reloading configuration from remote URL", "url", configURL)
 			
 			// Load the new config
-			v, err := loadRemoteConfig(ctx)
+			_, err := loadRemoteConfig(ctx)
 			if err != nil {
 				log.Error(err, "Failed to reload remote configuration")
 				continue
 			}
 			
-			// Parse the config
-			cfg, err := gate.LoadConfig(v)
-			if err != nil {
-				log.Error(err, "Failed to parse remote configuration")
-				continue
-			}
-			
-			// Apply the new config
-			// Note: Gate might need a restart or a specific API to reload config at runtime
-			// This implementation assumes there's a way to signal Gate to reload its config
 			log.Info("Successfully loaded new configuration from remote URL")
-			
-			// Here you would typically call an API to apply the new config to the running Gate instance
-			// For example: gate.ReloadConfig(cfg)
+			// Gate will detect the file change and reload automatically
 			
 		case <-ctx.Done():
 			log.Info("Stopping remote configuration reloader")
