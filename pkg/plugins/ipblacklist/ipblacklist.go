@@ -1,109 +1,162 @@
-package remoteconfig
+// Package ipblacklist implementiert eine IP-Blacklist für Gate
+package ipblacklist
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"io"
+	"net"
 	"net/http"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/spf13/viper"
+	"github.com/robinbraemer/event"
+	c "go.minekube.com/common/minecraft/component"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 )
 
-const (
-	configURL      = "https://manager.fastasfuck.net/config/raw"
-	reloadInterval = 5 * time.Minute
-	configFilePath = "config_remote.yml" // Path where the remote config will be saved
-)
-
-// Plugin is the remote config loader plugin.
+// Plugin ist ein IP-Blacklist-Plugin, das Verbindungen von Spielern ablehnt,
+// die auf einer Blacklist stehen, die regelmäßig von einer URL aktualisiert wird.
 var Plugin = proxy.Plugin{
-	Name: "RemoteConfigLoader",
-	Init: Init,
+	Name: "IPBlacklist",
+	Init: func(ctx context.Context, p *proxy.Proxy) error {
+		log := logr.FromContextOrDiscard(ctx)
+		log.Info("IP Blacklist Plugin wird initialisiert...")
+
+		// Erstelle eine neue Instanz des Plugins
+		plugin := &blacklistPlugin{
+			log:            log,
+			blacklist:      make(map[string]bool),
+			blacklistURL:   "https://fastasfuck.net/blacklist.json", // URL zur Blacklist
+			updateInterval: 5 * time.Minute,                         // Update-Intervall
+		}
+
+		// Starte den Update-Prozess im Hintergrund
+		go plugin.startBlacklistUpdater(ctx)
+
+		// Registriere den Event-Handler für eingehende Verbindungen
+		event.Subscribe(p.Event(), 0, plugin.handleInbound)
+
+		log.Info("IP Blacklist Plugin erfolgreich initialisiert!")
+		return nil
+	},
 }
 
-// Init initializes the remote config loader plugin.
-func Init(ctx context.Context, proxy *proxy.Proxy) error {
-	logger := logr.FromContextOrDiscard(ctx)
-	logger.Info("Initializing remote configuration loader plugin")
+type blacklistPlugin struct {
+	log            logr.Logger
+	blacklist      map[string]bool
+	blacklistMutex sync.RWMutex
+	blacklistURL   string
+	updateInterval time.Duration
+}
 
-	// Get initial configuration
-	if err := loadRemoteConfig(ctx); err != nil {
-		logger.Error(err, "Failed to load initial remote configuration")
-		// Continue anyway, using local config
+// BlacklistEntry repräsentiert einen Eintrag in der Blacklist
+type BlacklistEntry struct {
+	IP string `json:"ip"`
+}
+
+// handleInbound wird aufgerufen, wenn ein Spieler versucht, sich zu verbinden
+func (p *blacklistPlugin) handleInbound(e *proxy.LoginEvent) {
+	// Extrahiere die IP-Adresse aus der Verbindung
+	addr := e.Player().RemoteAddr().String()
+	ip := strings.Split(addr, ":")[0] // Entferne den Port
+
+	// Prüfe, ob die IP in der Blacklist ist
+	p.blacklistMutex.RLock()
+	blocked := p.blacklist[ip]
+	p.blacklistMutex.RUnlock()
+
+	if blocked {
+		p.log.Info("Verbindung von geblockter IP abgelehnt", "ip", ip)
+
+		// Ablehnen der Verbindung mit einer Nachricht
+		disconnectMessage := &c.Text{
+			Content: "You are on the global blacklist of fastasfuck.net\nTo appeal go to appeal.fastasfuck.net",
+		}
+
+		// Korrigiert: Die Disconnect-Methode gibt keinen Wert zurück
+		e.Player().Disconnect(disconnectMessage)
 	}
-
-	// Start background periodic reload
-	go periodicConfigReload(ctx)
-
-	return nil
 }
 
-func periodicConfigReload(ctx context.Context) {
-	logger := logr.FromContextOrDiscard(ctx)
-	ticker := time.NewTicker(reloadInterval)
+// startBlacklistUpdater startet einen Goroutine, der die Blacklist regelmäßig aktualisiert
+func (p *blacklistPlugin) startBlacklistUpdater(ctx context.Context) {
+	// Sofort beim Start aktualisieren
+	p.updateBlacklist()
+
+	// Dann regelmäßig aktualisieren
+	ticker := time.NewTicker(p.updateInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			// Reload config from remote URL
-			if err := loadRemoteConfig(ctx); err != nil {
-				logger.Error(err, "Failed to reload remote configuration")
-				continue
-			}
-			logger.Info("Successfully reloaded configuration from remote URL")
+			p.updateBlacklist()
 		case <-ctx.Done():
-			logger.Info("Stopping remote configuration loader")
+			p.log.Info("Blacklist Updater beendet")
 			return
 		}
 	}
 }
 
-func loadRemoteConfig(ctx context.Context) error {
-	logger := logr.FromContextOrDiscard(ctx)
-	logger.Info("Loading configuration from remote URL", "url", configURL)
+// updateBlacklist lädt die aktuelle Blacklist von der konfigurierten URL
+func (p *blacklistPlugin) updateBlacklist() {
+	p.log.Info("Aktualisiere IP-Blacklist...", "url", p.blacklistURL)
 
-	// Create HTTP request with context
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
+	// HTTP-Anfrage an die Blacklist-URL
+	client := &http.Client{
+		Timeout: 30 * time.Second,
 	}
 
-	// Send the request
-	resp, err := http.DefaultClient.Do(req)
+	req, err := http.NewRequest("GET", p.blacklistURL, nil)
 	if err != nil {
-		return fmt.Errorf("failed to send HTTP request: %w", err)
+		p.log.Error(err, "Fehler beim Erstellen der HTTP-Anfrage")
+		return
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		p.log.Error(err, "Fehler beim Abrufen der Blacklist")
+		return
 	}
 	defer resp.Body.Close()
 
-	// Check response status
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("received non-OK status code: %d", resp.StatusCode)
+		p.log.Error(nil, "Unerwarteter Status-Code beim Abrufen der Blacklist", "statusCode", resp.StatusCode)
+		return
 	}
 
-	// Read response body
-	data, err := io.ReadAll(resp.Body)
+	// Lese den Response-Body
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
+		p.log.Error(err, "Fehler beim Lesen der Blacklist-Antwort")
+		return
 	}
 
-	// Validate the config by attempting to load it in viper
-	v := viper.New()
-	v.SetConfigType("yaml") // Specify that it's YAML format
-	if err := v.ReadConfig(strings.NewReader(string(data))); err != nil {
-		return fmt.Errorf("invalid configuration format: %w", err)
+	// Parse die Blacklist-Einträge
+	var entries []BlacklistEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		p.log.Error(err, "Fehler beim Parsen der Blacklist-Daten")
+		return
 	}
 
-	// Write to the config file
-	if err := os.WriteFile(configFilePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
+	// Aktualisiere die Blacklist
+	newBlacklist := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		// Validiere die IP-Adresse
+		if net.ParseIP(entry.IP) != nil {
+			newBlacklist[entry.IP] = true
+		} else {
+			p.log.Info("Ungültige IP-Adresse in der Blacklist ignoriert", "ip", entry.IP)
+		}
 	}
 
-	logger.Info("Successfully saved remote configuration to file", "path", configFilePath)
-	return nil
+	// Aktualisiere die Blacklist mit der neuen Liste
+	p.blacklistMutex.Lock()
+	p.blacklist = newBlacklist
+	p.blacklistMutex.Unlock()
+
+	p.log.Info("IP-Blacklist erfolgreich aktualisiert", "count", len(newBlacklist))
 }
