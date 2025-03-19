@@ -112,7 +112,9 @@ func (p *joinNotifierPlugin) broadcastMessage(message string) {
 	comp := textComponent(message)
 	
 	for _, player := range p.proxy.Players() {
-		// Sende die Nachricht an den Spieler
-		player.SendMessage(comp)
+		// Sende die Nachricht an den Spieler und überprüfe auf Fehler
+		if err := player.SendMessage(comp); err != nil {
+			p.log.Error(err, "Fehler beim Senden der Nachricht", "player", player.Username())
+		}
 	}
 }
