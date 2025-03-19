@@ -16,6 +16,7 @@ var (
 	ipCheckFuncs    []IPCheckFunc
 	mutex           sync.RWMutex
 	logger          logr.Logger
+	loggerSet       bool
 )
 
 // IPCheckFunc ist eine Funktion, die prüft, ob eine IP blockiert ist
@@ -238,13 +239,13 @@ func watchFiles(watcher *fsnotify.Watcher, globalPath, routePath string) {
 			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
 				if event.Name == globalPath {
 					if err := globalBlacklist.Load(); err != nil {
-						if logger != nil {
+						if loggerSet {
 							logger.Error(err, "Failed to reload global blacklist")
 						}
 					}
 				} else if event.Name == routePath {
 					if err := routeBlacklist.Load(); err != nil {
-						if logger != nil {
+						if loggerSet {
 							logger.Error(err, "Failed to reload route blacklist")
 						}
 					}
@@ -254,7 +255,7 @@ func watchFiles(watcher *fsnotify.Watcher, globalPath, routePath string) {
 			if !ok {
 				return
 			}
-			if logger != nil {
+			if loggerSet {
 				logger.Error(err, "Error watching blacklist files")
 			}
 		}
@@ -264,4 +265,5 @@ func watchFiles(watcher *fsnotify.Watcher, globalPath, routePath string) {
 // SetLogger setzt den Logger für das Blacklist-Paket
 func SetLogger(log logr.Logger) {
 	logger = log
+	loggerSet = true
 }
