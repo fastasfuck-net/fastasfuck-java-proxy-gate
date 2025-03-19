@@ -46,7 +46,7 @@ type Blacklist struct {
 	ips     map[string]bool
 	mu      sync.RWMutex
 	path    string
-	watcher *fsnotify.Watcher
+	// watcher-Feld entfernt, da es nicht verwendet wird
 }
 
 // NewBlacklist erstellt eine neue Blacklist aus einer JSON-Datei
@@ -116,7 +116,7 @@ type RouteBlacklist struct {
 	routes  map[string]map[string]bool
 	mu      sync.RWMutex
 	path    string
-	watcher *fsnotify.Watcher
+	// watcher-Feld entfernt, da es nicht verwendet wird
 }
 
 // NewRouteBlacklist erstellt eine neue RouteBlacklist aus einer JSON-Datei
