@@ -3,7 +3,6 @@ package joinnotifier
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
