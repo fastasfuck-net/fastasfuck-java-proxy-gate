@@ -1,9 +1,8 @@
-// Package ipblacklist implementiert eine IP-Blacklist für Gate
 package ipblacklist
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +15,7 @@ import (
 	"github.com/robinbraemer/event"
 	c "go.minekube.com/common/minecraft/component"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
+	"go.minekube.com/gate/pkg/edition/java/lite/blacklist"
 )
 
 // Plugin ist ein IP-Blacklist-Plugin, das Verbindungen von Spielern ablehnt,
@@ -43,6 +43,13 @@ var Plugin = proxy.Plugin{
 			return nil
 		}
 
+		// Initialisiere lokale Blacklist-Dateien
+		err := blacklist.InitBlacklist("./ip_blacklist.json", "./route_blacklist.json")
+		if err != nil {
+			log.Error(err, "Fehler beim Initialisieren der lokalen Blacklists")
+			// Continue anyway - this is not fatal
+		}
+
 		// Starte den Update-Prozess im Hintergrund
 		go plugin.startBlacklistUpdater(ctx)
 
@@ -51,6 +58,9 @@ var Plugin = proxy.Plugin{
 			// Versuchen, verschiedene Arten von Events zu verarbeiten
 			plugin.handleEvent(e)
 		})
+
+		// Registriere die IP-Check-Funktion für Gate Lite
+		blacklist.RegisterIPCheckFunc(plugin.isBlocked)
 
 		log.Info("IP Blacklist Plugin erfolgreich initialisiert!", 
 			"blacklistURL", plugin.blacklistURL,
@@ -73,6 +83,43 @@ type blacklistPlugin struct {
 // BlacklistEntry repräsentiert einen Eintrag in der Blacklist
 type BlacklistEntry struct {
 	IP string `json:"ip"`
+}
+
+// isBlocked prüft, ob eine IP blockiert ist (für Gate Lite)
+func (p *blacklistPlugin) isBlocked(ipAddr string) bool {
+	if ipAddr == "" {
+		return false
+	}
+
+	ip := net.ParseIP(ipAddr)
+	if ip == nil {
+		p.log.V(1).Info("Ungültige IP-Adresse", "ip", ipAddr)
+		return false
+	}
+
+	// Lokale und private IPs nicht blockieren
+	if ip.IsLoopback() || isPrivateIP(ip) {
+		return false
+	}
+
+	p.blacklistMutex.RLock()
+	defer p.blacklistMutex.RUnlock()
+
+	// Prüfe exakte Übereinstimmung
+	if p.blacklist[ipAddr] {
+		p.log.Info("Verbindung von geblockter IP abgelehnt (Gate Lite)", "ip", ipAddr)
+		return true
+	}
+
+	// Prüfe CIDR-Bereiche
+	for _, cidr := range p.blacklistCIDR {
+		if cidr.Contains(ip) {
+			p.log.Info("Verbindung von geblockter CIDR-Range abgelehnt (Gate Lite)", "ip", ipAddr)
+			return true
+		}
+	}
+
+	return false
 }
 
 // handleEvent verarbeitet verschiedene Event-Typen
@@ -310,41 +357,6 @@ func extractIP(addr net.Addr) string {
 		return ipStr
 	}
 	return ""
-}
-
-// isBlocked prüft, ob eine IP-Adresse blockiert ist
-func (p *blacklistPlugin) isBlocked(ipStr string) bool {
-	if ipStr == "" {
-		return false
-	}
-
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		p.log.V(1).Info("Ungültige IP-Adresse", "ip", ipStr)
-		return false
-	}
-
-	// Lokale und private IPs nicht blockieren
-	if ip.IsLoopback() || isPrivateIP(ip) {
-		return false
-	}
-
-	p.blacklistMutex.RLock()
-	defer p.blacklistMutex.RUnlock()
-
-	// Prüfe exakte Übereinstimmung
-	if p.blacklist[ipStr] {
-		return true
-	}
-
-	// Prüfe CIDR-Bereiche
-	for _, cidr := range p.blacklistCIDR {
-		if cidr.Contains(ip) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // isPrivateIP prüft, ob eine IP-Adresse im privaten Bereich liegt
