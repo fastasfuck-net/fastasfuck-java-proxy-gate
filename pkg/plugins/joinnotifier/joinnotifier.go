@@ -1,19 +1,17 @@
 package joinnotifier
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/robinbraemer/event"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 )
 
-// Plugin ist ein Gate-Plugin, das bei jedem Spieler-Join im Lite-Mode eine
-// vereinfachte API-Benachrichtigung senden soll.
+// Plugin ist ein Gate-Plugin, das bei jedem Spieler-Join eine Nachricht im Chat anzeigt
 var Plugin = proxy.Plugin{
 	Name: "JoinNotifier",
 	Init: func(ctx context.Context, p *proxy.Proxy) error {
@@ -22,13 +20,12 @@ var Plugin = proxy.Plugin{
 
 		// Erstelle eine neue Instanz des Plugins
 		plugin := &joinNotifierPlugin{
-			log:        log,
+			log:          log,
+			proxy:        p,
 			// HIER EINSTELLUNGEN ANPASSEN:
-			apiURL:     "https://example.com/api/player-join", // URL der API
-			timeout:    5 * time.Second,                      // Timeout für API-Anfragen
-			enabled:    true,                                 // Plugin aktivieren/deaktivieren
-			retryCount: 3,                                    // Anzahl der Wiederholungsversuche
-			retryDelay: time.Second,                          // Verzögerung zwischen Wiederholungsversuchen
+			enabled:      true,                                 // Plugin aktivieren/deaktivieren
+			joinMessage:  "&8[&aGatelite&8] &eDer Spieler &b%s &ehat den Server betreten!",
+			quitMessage:  "&8[&aGatelite&8] &eDer Spieler &b%s &ehat den Server verlassen!",
 		}
 
 		if !plugin.enabled {
@@ -36,114 +33,77 @@ var Plugin = proxy.Plugin{
 			return nil
 		}
 
-		log.Info("Join Notifier Plugin erfolgreich initialisiert!")
-		log.Info("HINWEIS: Dieses Plugin erfordert eine externe Lösung für Gate Lite.")
-		log.Info("Bitte verwenden Sie das externe Python- oder Bash-Script für die Loganalyse.")
-		
-		// Führe einen API-Test durch
-		go plugin.testAPIConnection()
+		// Event-Handler registrieren
+		subscription := event.Subscribe(p.Event(), 0, plugin.handlePlayerJoin)
+		disconnectSubscription := event.Subscribe(p.Event(), 0, plugin.handlePlayerDisconnect)
 
+		log.Info("Join Notifier Plugin erfolgreich initialisiert!")
+		
 		return nil
 	},
 }
 
 type joinNotifierPlugin struct {
-	log         logr.Logger
-	apiURL      string
-	timeout     time.Duration
-	enabled     bool
-	retryCount  int
-	retryDelay  time.Duration
+	log          logr.Logger
+	proxy        *proxy.Proxy
+	enabled      bool
+	joinMessage  string
+	quitMessage  string
 }
 
-// JoinNotification enthält die Daten, die an die API gesendet werden
-type JoinNotification struct {
-	PlayerName string    `json:"playerName"`
-	PlayerUUID string    `json:"playerUUID,omitempty"`
-	IPAddress  string    `json:"ipAddress"`
-	JoinTime   time.Time `json:"joinTime"`
+// Wandelt Minecraft-Farbcodes (z.B. &a) in ihre entsprechenden Codes um
+func colorize(message string) string {
+	return strings.ReplaceAll(message, "&", "§")
 }
 
-// sendNotification sendet eine Benachrichtigung an die API
-func (p *joinNotifierPlugin) sendNotification(notification JoinNotification) {
-	p.log.Info("Sende Join-Benachrichtigung an API",
-		"player", notification.PlayerName,
-		"ip", notification.IPAddress)
-
-	jsonData, err := json.Marshal(notification)
-	if err != nil {
-		p.log.Error(err, "Fehler beim Serialisieren der Benachrichtigung")
+// PlayerJoinEvent-Handler
+func (p *joinNotifierPlugin) handlePlayerJoin(e *proxy.PostLoginEvent) {
+	player := e.Player()
+	if player == nil {
 		return
 	}
 
-	// Sende mit Wiederholungsversuchen
-	var lastError error
-	for attempt := 0; attempt <= p.retryCount; attempt++ {
-		if attempt > 0 {
-			p.log.Info("Wiederhole API-Anfrage", "versuch", attempt, "maxVersuche", p.retryCount)
-			time.Sleep(p.retryDelay)
-		}
-
-		err = p.doSendRequest(jsonData)
-		if err == nil {
-			if attempt > 0 {
-				p.log.Info("API-Anfrage nach Wiederholung erfolgreich", "versuche", attempt+1)
-			}
-			return
-		}
-		
-		lastError = err
-		p.log.Error(err, "Fehler beim Senden der API-Anfrage", "versuch", attempt+1)
-	}
-
-	p.log.Error(lastError, "Alle Versuche, die API-Anfrage zu senden, sind fehlgeschlagen")
+	// Hole den Spielernamen
+	playerName := player.Username()
+	
+	// Erstelle die formatierte Nachricht
+	message := fmt.Sprintf(p.joinMessage, playerName)
+	coloredMessage := colorize(message)
+	
+	p.log.Info("Spieler hat den Server betreten", "player", playerName)
+	
+	// Sende Nachricht an alle Spieler
+	go func() {
+		// Warte kurz, damit der Login abgeschlossen ist
+		time.Sleep(500 * time.Millisecond)
+		p.broadcastMessage(coloredMessage)
+	}()
 }
 
-// doSendRequest führt die eigentliche HTTP-Anfrage durch
-func (p *joinNotifierPlugin) doSendRequest(jsonData []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", p.apiURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("fehler beim Erstellen der HTTP-Anfrage: %w", err)
+// PlayerDisconnectEvent-Handler
+func (p *joinNotifierPlugin) handlePlayerDisconnect(e *proxy.DisconnectEvent) {
+	player := e.Player()
+	if player == nil {
+		return
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "JoinNotifier-Plugin/1.0")
-
-	client := &http.Client{
-		Timeout: p.timeout,
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("fehler beim Senden der HTTP-Anfrage: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("API antwortete mit Status-Code %d", resp.StatusCode)
-	}
-
-	p.log.Info("Join-Benachrichtigung erfolgreich gesendet")
-	return nil
+	// Hole den Spielernamen
+	playerName := player.Username()
+	
+	// Erstelle die formatierte Nachricht
+	message := fmt.Sprintf(p.quitMessage, playerName)
+	coloredMessage := colorize(message)
+	
+	p.log.Info("Spieler hat den Server verlassen", "player", playerName)
+	
+	// Sende Nachricht an alle Spieler
+	p.broadcastMessage(coloredMessage)
 }
 
-// testAPIConnection testet die API-Verbindung
-func (p *joinNotifierPlugin) testAPIConnection() {
-	time.Sleep(5 * time.Second) // Warte ein wenig, bis der Server vollständig gestartet ist
-	
-	p.log.Info("Teste API-Verbindung...")
-	
-	// Erstelle eine Test-Benachrichtigung
-	testNotification := JoinNotification{
-		PlayerName: "TestSpieler",
-		PlayerUUID: "00000000-0000-0000-0000-000000000000",
-		IPAddress:  "127.0.0.1",
-		JoinTime:   time.Now(),
+// Hilfsfunktion zum Senden einer Nachricht an alle Spieler
+func (p *joinNotifierPlugin) broadcastMessage(message string) {
+	for _, player := range p.proxy.Players() {
+		// Sende die Nachricht an den Spieler
+		player.SendMessage(message)
 	}
-
-	// Sende Testbenachrichtigung
-	p.sendNotification(testNotification)
 }
