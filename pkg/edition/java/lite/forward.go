@@ -27,7 +27,8 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// Forward forwards a client connection to a matching backend route.
+// relevant part of Forward function from pkg/edition/java/lite/forward.go
+
 func Forward(
 	dialTimeout time.Duration,
 	routes []config.Route,
@@ -44,14 +45,12 @@ func Forward(
 		return
 	}
 
-	// Setze den Logger für das Blacklist-Paket, wenn die Funktion existiert
-	if blacklist.SetLogger != nil {
-		blacklist.SetLogger(log)
-	}
+	// Setze den Logger für das Blacklist-Paket
+	blacklist.SetLogger(log)
 
 	// Extrahiere die Client-IP und prüfe auf Blacklist
 	clientIP, _, err := net.SplitHostPort(src.RemoteAddr().String())
-	if err == nil && blacklist.CheckIP != nil && blacklist.CheckIP(clientIP) {
+	if err == nil && blacklist.CheckIP(clientIP) {
 		log.Info("Connection rejected - IP is blacklisted", "ip", clientIP)
 		return
 	}
