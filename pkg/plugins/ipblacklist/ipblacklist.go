@@ -2,7 +2,7 @@ package ipblacklist
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
