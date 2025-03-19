@@ -28,38 +28,38 @@ import (
 
 // Forward forwards a client connection to a matching backend route.
 func Forward(
-	dialTimeout time.Duration,
-	routes []config.Route,
-	log logr.Logger,
-	client netmc.MinecraftConn,
-	handshake *packet.Handshake,
-	pc *proto.PacketContext,
+    dialTimeout time.Duration,
+    routes []config.Route,
+    log logr.Logger,
+    client netmc.MinecraftConn,
+    handshake *packet.Handshake,
+    pc *proto.PacketContext,
 ) {
-	defer func() { _ = client.Close() }()
+    defer func() { _ = client.Close() }()
 
-	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake)
-	if err != nil {
-		errs.V(log, err).Info("failed to find route", "error", err)
-		return
-	}
+    log, src, route, nextBackend, err := findRoute(routes, log, client, handshake)
+    if err != nil {
+        errs.V(log, err).Info("failed to find route", "error", err)
+        return
+    }
 
-	// Find a backend to dial successfully.
-	log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
-		conn, err := dialRoute(client.Context(), dialTimeout, src.RemoteAddr(), route, backendAddr, handshake, pc, false)
-		return log, conn, err
-	})
-	if err != nil {
-		return
-	}
-	defer func() { _ = dst.Close() }()
+    // Find a backend to dial successfully.
+    log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
+        conn, err := dialRoute(client.Context(), dialTimeout, src.RemoteAddr(), route, backendAddr, handshake, pc, false)
+        return log, conn, err
+    })
+    if err != nil {
+        return
+    }
+    defer func() { _ = dst.Close() }()
 
-	if err = emptyReadBuff(client, dst); err != nil {
-		errs.V(log, err).Info("failed to empty client buffer", "error", err)
-		return
-	}
+    if err = emptyReadBuff(client, dst); err != nil {
+        errs.V(log, err).Info("failed to empty client buffer", "error", err)
+        return
+    }
 
-	log.Info("forwarding connection", "backendAddr", netutil.Host(dst.RemoteAddr()))
-	pipe(log, src, dst)
+    log.Info("forwarding connection", "backendAddr", netutil.Host(dst.RemoteAddr()))
+    pipe(log, src, dst)
 }
 
 // errAllBackendsFailed is returned when all backends failed to dial.
