@@ -8,6 +8,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/robinbraemer/event"
+	"go.minekube.com/common/minecraft/component"
+	"go.minekube.com/common/minecraft/component/codec/legacy"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 )
 
@@ -34,8 +36,8 @@ var Plugin = proxy.Plugin{
 		}
 
 		// Event-Handler registrieren
-		subscription := event.Subscribe(p.Event(), 0, plugin.handlePlayerJoin)
-		disconnectSubscription := event.Subscribe(p.Event(), 0, plugin.handlePlayerDisconnect)
+		_ = event.Subscribe(p.Event(), 0, plugin.handlePlayerJoin)
+		_ = event.Subscribe(p.Event(), 0, plugin.handlePlayerDisconnect)
 
 		log.Info("Join Notifier Plugin erfolgreich initialisiert!")
 		
@@ -51,9 +53,16 @@ type joinNotifierPlugin struct {
 	quitMessage  string
 }
 
-// Wandelt Minecraft-Farbcodes (z.B. &a) in ihre entsprechenden Codes um
-func colorize(message string) string {
-	return strings.ReplaceAll(message, "&", "§")
+// Wandelt einen String in eine component.Component um
+func textComponent(message string) component.Component {
+	// Legacy-Parser für Minecraft-Farbcodes verwenden
+	legacyParser := &legacy.Legacy{}
+	comp, err := legacyParser.Unmarshal([]byte(message))
+	if err != nil {
+		// Bei Fehler einen einfachen Text ohne Farben zurückgeben
+		return &component.Text{Content: message}
+	}
+	return comp
 }
 
 // PlayerJoinEvent-Handler
@@ -68,7 +77,6 @@ func (p *joinNotifierPlugin) handlePlayerJoin(e *proxy.PostLoginEvent) {
 	
 	// Erstelle die formatierte Nachricht
 	message := fmt.Sprintf(p.joinMessage, playerName)
-	coloredMessage := colorize(message)
 	
 	p.log.Info("Spieler hat den Server betreten", "player", playerName)
 	
@@ -76,7 +84,7 @@ func (p *joinNotifierPlugin) handlePlayerJoin(e *proxy.PostLoginEvent) {
 	go func() {
 		// Warte kurz, damit der Login abgeschlossen ist
 		time.Sleep(500 * time.Millisecond)
-		p.broadcastMessage(coloredMessage)
+		p.broadcastMessage(message)
 	}()
 }
 
@@ -92,18 +100,20 @@ func (p *joinNotifierPlugin) handlePlayerDisconnect(e *proxy.DisconnectEvent) {
 	
 	// Erstelle die formatierte Nachricht
 	message := fmt.Sprintf(p.quitMessage, playerName)
-	coloredMessage := colorize(message)
 	
 	p.log.Info("Spieler hat den Server verlassen", "player", playerName)
 	
 	// Sende Nachricht an alle Spieler
-	p.broadcastMessage(coloredMessage)
+	p.broadcastMessage(message)
 }
 
 // Hilfsfunktion zum Senden einer Nachricht an alle Spieler
 func (p *joinNotifierPlugin) broadcastMessage(message string) {
+	// Konvertiere den String zu einem component.Component
+	comp := textComponent(message)
+	
 	for _, player := range p.proxy.Players() {
 		// Sende die Nachricht an den Spieler
-		player.SendMessage(message)
+		player.SendMessage(comp)
 	}
 }
