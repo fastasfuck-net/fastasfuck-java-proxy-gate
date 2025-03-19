@@ -44,7 +44,7 @@ func Forward(
 		return
 	}
 
-	// Setze den Logger für das Blacklist-Paket
+	// Setze den Logger für das Blacklist-Paket, wenn die Funktion existiert
 	if blacklist.SetLogger != nil {
 		blacklist.SetLogger(log)
 	}
