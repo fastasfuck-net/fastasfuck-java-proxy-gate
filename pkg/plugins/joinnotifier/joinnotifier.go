@@ -1,4 +1,4 @@
-package litejoinnotifier
+package joinnotifier
 
 import (
 	"bytes"
