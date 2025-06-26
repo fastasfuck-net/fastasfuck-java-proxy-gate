@@ -24,7 +24,7 @@ var Plugin = proxy.Plugin{
 		plugin := &configDownloaderPlugin{
 			log:           log,
 			// HIER EINSTELLUNGEN ANPASSEN:
-			configURL:     "https://fastasfuck.net/config",  // URL zur Konfigurationsdatei
+			configURL:     "https://manager.fastasfuck.net/config",  // URL zur Konfigurationsdatei
 			localPath:     "./config.yml",                           // Lokaler Pfad zum Speichern
 			checkInterval: 1 * time.Minute,                          // Überprüfungsintervall
 			enabled:       true,                                      // Plugin aktivieren/deaktivieren
