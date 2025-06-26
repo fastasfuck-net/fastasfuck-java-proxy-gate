@@ -6,18 +6,14 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"reflect"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/robinbraemer/event"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
-	"go.minekube.com/gate/pkg/gate/config"
-	"go.minekube.com/gate/pkg/internal/reload"
 )
 
 // Plugin ist ein Gate-Plugin, das in regelmäßigen Abständen eine Konfigurationsdatei
-// herunterlädt, lokal speichert und Gate automatisch neu lädt.
+// herunterlädt und das Auto-Reload von Gate triggert.
 var Plugin = proxy.Plugin{
 	Name: "ConfigDownloader",
 	Init: func(ctx context.Context, p *proxy.Proxy) error {
@@ -27,14 +23,12 @@ var Plugin = proxy.Plugin{
 		// Erstelle eine neue Instanz des Plugins
 		plugin := &configDownloaderPlugin{
 			log:           log,
-			proxy:         p,
-			eventMgr:      p.Event(),
 			// HIER EINSTELLUNGEN ANPASSEN:
 			configURL:     "https://manager.fastasfuck.net/config",  // URL zur Konfigurationsdatei
 			localPath:     "./config.yml",                           // Lokaler Pfad zum Speichern
 			checkInterval: 1 * time.Minute,                          // Überprüfungsintervall
 			enabled:       true,                                      // Plugin aktivieren/deaktivieren
-			autoReload:    true,                                      // Automatisches Reload aktivieren
+			forceReload:   true,                                      // File-Touch nach Download
 		}
 
 		if !plugin.enabled {
@@ -48,31 +42,24 @@ var Plugin = proxy.Plugin{
 		log.Info("Config Downloader Plugin erfolgreich initialisiert!", 
 			"configURL", plugin.configURL,
 			"localPath", plugin.localPath,
-			"checkInterval", plugin.checkInterval,
-			"autoReload", plugin.autoReload)
+			"checkInterval", plugin.checkInterval)
 		return nil
 	},
 }
 
 type configDownloaderPlugin struct {
 	log           logr.Logger
-	proxy         *proxy.Proxy
-	eventMgr      event.Manager
 	configURL     string
 	localPath     string
 	checkInterval time.Duration
 	enabled       bool
-	autoReload    bool
-	currentConfig *config.Config
+	forceReload   bool
 }
 
 // startConfigDownloader startet einen Goroutine, der die Konfigurationsdatei regelmäßig herunterlädt
 func (p *configDownloaderPlugin) startConfigDownloader(ctx context.Context) {
-	// Aktuelle Config als Referenz speichern
-	p.currentConfig = p.proxy.Config()
-
 	// Sofort beim Start herunterladen
-	if err := p.downloadAndReloadConfig(); err != nil {
+	if err := p.downloadConfig(); err != nil {
 		p.log.Error(err, "Initialer Konfigurationsdownload fehlgeschlagen")
 	}
 
@@ -83,7 +70,7 @@ func (p *configDownloaderPlugin) startConfigDownloader(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			if err := p.downloadAndReloadConfig(); err != nil {
+			if err := p.downloadConfig(); err != nil {
 				p.log.Error(err, "Konfigurationsdownload fehlgeschlagen")
 			}
 		case <-ctx.Done():
@@ -91,26 +78,6 @@ func (p *configDownloaderPlugin) startConfigDownloader(ctx context.Context) {
 			return
 		}
 	}
-}
-
-// downloadAndReloadConfig lädt die Config herunter und triggert bei Änderungen ein Reload
-func (p *configDownloaderPlugin) downloadAndReloadConfig() error {
-	// 1. Config herunterladen
-	if err := p.downloadConfig(); err != nil {
-		return err
-	}
-
-	// 2. Prüfen ob Auto-Reload aktiviert ist
-	if !p.autoReload {
-		return nil
-	}
-
-	// 3. Config neu laden und prüfen ob sich etwas geändert hat
-	if err := p.triggerConfigReload(); err != nil {
-		return fmt.Errorf("fehler beim Triggern des Config-Reloads: %w", err)
-	}
-
-	return nil
 }
 
 // downloadConfig lädt die Konfigurationsdatei von der konfigurierten URL herunter
@@ -142,113 +109,119 @@ func (p *configDownloaderPlugin) downloadConfig() error {
 		return fmt.Errorf("unerwarteter Status-Code beim Abrufen der Konfiguration: %d", resp.StatusCode)
 	}
 
-	// Datei zum Schreiben öffnen/erstellen
-	tempFile := p.localPath + ".tmp"
-	file, err := os.Create(tempFile)
+	// Prüfe zuerst ob sich der Inhalt geändert hat
+	newContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("fehler beim Erstellen der temporären Datei: %w", err)
+		return fmt.Errorf("fehler beim Lesen der Response: %w", err)
 	}
 
-	// Inhalt in temporäre Datei schreiben
-	n, err := io.Copy(file, resp.Body)
-	if err != nil {
-		file.Close() // Schließe die Datei, auch wenn ein Fehler auftritt
-		os.Remove(tempFile) // Lösche die temporäre Datei
-		return fmt.Errorf("fehler beim Schreiben der Konfigurationsdatei: %w", err)
-	}
-	
-	file.Close() // Datei schließen, bevor wir sie umbenennen
-
-	// Überprüfe, ob die Datei leer ist
-	if n == 0 {
-		os.Remove(tempFile)
-		return fmt.Errorf("heruntergeladene Konfigurationsdatei ist leer")
+	// Prüfe ob die neue Config anders ist als die aktuelle
+	if !p.hasConfigChanged(newContent) {
+		p.log.Info("Config hat sich nicht geändert, kein Download nötig")
+		return nil
 	}
 
-	// Temporäre Datei zur Zieldatei umbenennen (atomare Operation)
-	if err := os.Rename(tempFile, p.localPath); err != nil {
-		return fmt.Errorf("fehler beim Umbenennen der temporären Datei: %w", err)
+	// Backup der aktuellen Config erstellen
+	if err := p.backupCurrentConfig(); err != nil {
+		p.log.Error(err, "Warnung: Konnte keine Backup-Datei erstellen")
+	}
+
+	// Neue Config speichern
+	if err := p.saveConfig(newContent); err != nil {
+		return err
+	}
+
+	// Auto-Reload triggern wenn aktiviert
+	if p.forceReload {
+		if err := p.triggerAutoReload(); err != nil {
+			p.log.Error(err, "Warnung: Konnte Auto-Reload nicht triggern")
+		}
 	}
 
 	p.log.Info("Konfigurationsdatei erfolgreich heruntergeladen und gespeichert", 
-		"größe", n, 
+		"größe", len(newContent), 
 		"pfad", p.localPath)
 
 	return nil
 }
 
-// triggerConfigReload triggert ein manuelles Config-Reload
-func (p *configDownloaderPlugin) triggerConfigReload() error {
-	p.log.Info("Triggere Config-Reload...")
-
-	// Backup der aktuellen Config
-	prevConfig := p.currentConfig
-
-	// Neue Config laden (simuliert Gate's LoadConfig)
-	newConfig, err := p.loadConfigFromFile()
+// hasConfigChanged prüft ob sich der Config-Inhalt geändert hat
+func (p *configDownloaderPlugin) hasConfigChanged(newContent []byte) bool {
+	// Aktuelle Config-Datei lesen
+	currentContent, err := os.ReadFile(p.localPath)
 	if err != nil {
-		return fmt.Errorf("fehler beim Laden der neuen Config: %w", err)
+		// Datei existiert nicht oder kann nicht gelesen werden -> auf jeden Fall herunterladen
+		return true
 	}
 
-	// Prüfen ob sich die Config geändert hat
-	if reflect.DeepEqual(prevConfig, newConfig) {
-		p.log.Info("Config hat sich nicht geändert, kein Reload nötig")
-		return nil
+	// Inhalte vergleichen
+	return string(currentContent) != string(newContent)
+}
+
+// backupCurrentConfig erstellt ein Backup der aktuellen Config
+func (p *configDownloaderPlugin) backupCurrentConfig() error {
+	backupPath := p.localPath + ".backup." + time.Now().Format("20060102-150405")
+	
+	// Aktuelle Config lesen
+	content, err := os.ReadFile(p.localPath)
+	if err != nil {
+		return err // Datei existiert möglicherweise nicht
 	}
 
-	p.log.Info("Config-Änderungen erkannt, starte Reload...")
+	// Backup schreiben
+	if err := os.WriteFile(backupPath, content, 0644); err != nil {
+		return fmt.Errorf("fehler beim Erstellen des Backups: %w", err)
+	}
 
-	// Config-Update-Event feuern
-	reload.FireConfigUpdate(p.eventMgr, newConfig, prevConfig)
-
-	// Aktuelle Config aktualisieren
-	p.currentConfig = newConfig
-
-	p.log.Info("Config-Reload erfolgreich abgeschlossen")
+	p.log.Info("Backup der aktuellen Config erstellt", "backup", backupPath)
 	return nil
 }
 
-// loadConfigFromFile lädt die Config-Datei (vereinfachte Version von Gate's LoadConfig)
-func (p *configDownloaderPlugin) loadConfigFromFile() (*config.Config, error) {
-	// Hier würden wir normalerweise Gate's LoadConfig Funktion verwenden
-	// Da wir darauf keinen direkten Zugriff haben, implementieren wir eine vereinfachte Version
+// saveConfig speichert die neue Config atomisch
+func (p *configDownloaderPlugin) saveConfig(content []byte) error {
+	// Temporäre Datei erstellen
+	tempFile := p.localPath + ".tmp"
 	
-	// Für jetzt geben wir einen Fehler zurück und loggen, dass das File geladen wurde
-	// In einer vollständigen Implementierung würde hier die YAML/JSON geparst werden
-	
-	p.log.Info("Config-Datei wurde aktualisiert", "pfad", p.localPath)
-	
-	// File-Touch um sicherzustellen, dass File-Watcher triggern
-	if err := p.touchFile(); err != nil {
-		p.log.Error(err, "Fehler beim File-Touch")
+	if err := os.WriteFile(tempFile, content, 0644); err != nil {
+		return fmt.Errorf("fehler beim Schreiben der temporären Datei: %w", err)
 	}
-	
-	// Da wir Gate's LoadConfig nicht direkt aufrufen können, 
-	// returnieren wir die aktuelle Config und hoffen auf File-Watcher
-	return p.currentConfig, nil
+
+	// Atomisch umbenennen
+	if err := os.Rename(tempFile, p.localPath); err != nil {
+		os.Remove(tempFile) // Aufräumen bei Fehler
+		return fmt.Errorf("fehler beim Umbenennen der temporären Datei: %w", err)
+	}
+
+	return nil
 }
 
-// touchFile "berührt" die Config-Datei um File-Watcher zu triggern
-func (p *configDownloaderPlugin) touchFile() error {
-	// Öffne die Datei zum Schreiben (ohne Inhalt zu ändern)
-	file, err := os.OpenFile(p.localPath, os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+// triggerAutoReload triggert Gate's Auto-Reload durch File-Modification
+func (p *configDownloaderPlugin) triggerAutoReload() error {
+	p.log.Info("Triggere Auto-Reload durch File-Touch...")
 
-	// Sync um sicherzustellen, dass das OS den File-Change erkennt
-	return file.Sync()
+	// Kleine Wartezeit um sicherzustellen, dass die Datei vollständig geschrieben wurde
+	time.Sleep(100 * time.Millisecond)
+
+	// File-Touch: Aktualisiere die Modifikationszeit der Datei
+	now := time.Now()
+	if err := os.Chtimes(p.localPath, now, now); err != nil {
+		return fmt.Errorf("fehler beim File-Touch: %w", err)
+	}
+
+	p.log.Info("Auto-Reload wurde getriggert")
+	return nil
 }
 
-// Alternative Implementierung: Restart Gate
-func (p *configDownloaderPlugin) restartGate() {
-	p.log.Info("WARNUNG: Config wurde geändert. Gate sollte neu gestartet werden für vollständige Anwendung der Änderungen.")
-	p.log.Info("Für automatisches Restart verwenden Sie ein Process-Manager wie systemd oder supervisor.")
+// Optional: Methode zum manuellen Triggern eines Gate-Restarts
+func (p *configDownloaderPlugin) forceRestart() {
+	p.log.Info("WICHTIG: Config wurde geändert!")
+	p.log.Info("Für sofortige Anwendung aller Änderungen wird ein Gate-Restart empfohlen.")
+	p.log.Info("Verwenden Sie 'systemctl restart gate' oder Ihren Process-Manager.")
 	
-	// Hier könnte man auch os.Exit(0) aufrufen, wenn man möchte dass Gate sich beendet
-	// und von einem externen Process-Manager neu gestartet wird:
+	// Optional: Gate automatisch beenden (wenn von systemd/supervisor verwaltet)
+	// Vorsicht: Nur aktivieren wenn Sie sicher sind, dass Gate automatisch neu gestartet wird!
 	// 
-	// p.log.Info("Gate wird beendet für Restart...")
+	// p.log.Info("Gate wird für automatischen Restart beendet...")
+	// time.Sleep(1 * time.Second) // Kurz warten damit Log-Message ausgegeben wird
 	// os.Exit(0)
 }
