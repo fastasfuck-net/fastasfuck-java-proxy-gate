@@ -3,12 +3,10 @@ on:
   push:
   pull_request:
     types: [ opened, reopened ]
-
 # Add this permissions block to fix the 403 Forbidden error
 permissions:
   contents: write
   packages: write
-
 env:
   REGISTRY: ghcr.io
 jobs:
@@ -69,7 +67,7 @@ jobs:
           IMAGE=${{ env.REGISTRY }}/${{ github.repository }}:${REF}
           IMAGE_LATEST=${{ env.REGISTRY }}/${{ github.repository }}:latest
           
-          echo "image=${IMAGE}" >> $GITHUB_STATE
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "image_latest=${IMAGE_LATEST}" >> $GITHUB_OUTPUT
           
           echo "${IMAGE}" >> $GITHUB_STEP_SUMMARY
