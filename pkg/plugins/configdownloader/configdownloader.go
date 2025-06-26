@@ -212,16 +212,3 @@ func (p *configDownloaderPlugin) triggerAutoReload() error {
 	return nil
 }
 
-// Optional: Methode zum manuellen Triggern eines Gate-Restarts
-func (p *configDownloaderPlugin) forceRestart() {
-	p.log.Info("WICHTIG: Config wurde geändert!")
-	p.log.Info("Für sofortige Anwendung aller Änderungen wird ein Gate-Restart empfohlen.")
-	p.log.Info("Verwenden Sie 'systemctl restart gate' oder Ihren Process-Manager.")
-	
-	// Optional: Gate automatisch beenden (wenn von systemd/supervisor verwaltet)
-	// Vorsicht: Nur aktivieren wenn Sie sicher sind, dass Gate automatisch neu gestartet wird!
-	// 
-	// p.log.Info("Gate wird für automatischen Restart beendet...")
-	// time.Sleep(1 * time.Second) // Kurz warten damit Log-Message ausgegeben wird
-	// os.Exit(0)
-}
