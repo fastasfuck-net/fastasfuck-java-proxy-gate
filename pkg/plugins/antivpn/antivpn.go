@@ -171,132 +171,6 @@ type connectionLog struct {
 	ISP          string
 }
 
-// isBlocked prüft, ob eine IP als VPN/Proxy erkannt wird
-func (p *vpnProxyPlugin) isBlocked(ipAddr string) bool {
-	if ipAddr == "" {
-		return false
-	}
-
-	ip := net.ParseIP(ipAddr)
-	if ip == nil {
-		p.log.V(1).Info("Ungültige IP-Adresse", "ip", ipAddr)
-		return false
-	}
-
-	// Lokale und private IPs nicht blockieren
-	if ip.IsLoopback() || isPrivateIP(ip) {
-		return false
-	}
-
-	// Prüfe verschiedene Erkennungsmethoden
-	result := p.analyzeIP(ipAddr)
-	
-	if result.IsVPN {
-		p.log.Info("VPN/Proxy erkannt", 
-			"ip", ipAddr,
-			"asnMatch", result.ASNMatch,
-			"ispMatch", result.ISPMatch,
-			"ipListed", result.IPListed,
-			"asn", result.ASN,
-			"isp", result.ISP)
-		return true
-	}
-
-	return false
-}
-
-// sendDisconnectMessage sendet eine ordentliche Minecraft-Disconnect-Nachricht
-func (p *vpnProxyPlugin) sendDisconnectMessage(conn net.Conn, message string) error {
-	// JSON-Nachricht für Minecraft formatieren
-	disconnectMsg := map[string]interface{}{
-		"text": message,
-		"color": "red",
-	}
-	
-	jsonMsg, err := json.Marshal(disconnectMsg)
-	if err != nil {
-		return err
-	}
-
-	// Packet ID für Disconnect (in Login State = 0x00)
-	packetID := byte(0x00)
-	
-	// JSON-String-Länge als VarInt
-	jsonLen := len(jsonMsg)
-	
-	// Berechne Paket-Länge (Packet ID + String Length VarInt + String)
-	packetLen := 1 + getVarIntSize(jsonLen) + jsonLen
-	
-	// Buffer für das komplette Paket
-	buf := make([]byte, getVarIntSize(packetLen)+packetLen)
-	offset := 0
-	
-	// Schreibe Paket-Länge als VarInt
-	offset += writeVarInt(buf[offset:], packetLen)
-	
-	// Schreibe Packet ID
-	buf[offset] = packetID
-	offset++
-	
-	// Schreibe JSON-String-Länge als VarInt
-	offset += writeVarInt(buf[offset:], jsonLen)
-	
-	// Schreibe JSON-String
-	copy(buf[offset:], jsonMsg)
-	
-	// Sende das Paket
-	_, err = conn.Write(buf)
-	if err != nil {
-		return err
-	}
-	
-	// Kurz warten damit die Nachricht ankommt
-	time.Sleep(100 * time.Millisecond)
-	
-	return nil
-}
-
-// Hilfsfunktionen für VarInt-Encoding
-func getVarIntSize(value int) int {
-	if value == 0 {
-		return 1
-	}
-	size := 0
-	for value > 0 {
-		value >>= 7
-		size++
-	}
-	return size
-}
-
-func writeVarInt(buf []byte, value int) int {
-	written := 0
-	for {
-		if (value & 0x80) == 0 {
-			buf[written] = byte(value)
-			written++
-			break
-		}
-		buf[written] = byte(value&0x7F | 0x80)
-		written++
-		value >>= 7
-	}
-	return written
-}
-
-// sendDisconnectToConnection sendet eine Disconnect-Nachricht direkt an eine Verbindung
-func (p *vpnProxyPlugin) sendDisconnectToConnection(conn net.Conn, ipAddr string) {
-	// Versuche eine ordentliche Minecraft-Disconnect-Nachricht zu senden
-	if err := p.sendDisconnectMessage(conn, p.blockMessage); err != nil {
-		p.log.V(1).Info("Fehler beim Senden der Disconnect-Nachricht", "ip", ipAddr, "error", err)
-	}
-	
-	// Schließe die Verbindung nach kurzer Verzögerung
-	time.AfterFunc(200*time.Millisecond, func() {
-		conn.Close()
-	})
-}
-
 // analyzeIP führt eine umfassende Analyse einer IP-Adresse durch
 func (p *vpnProxyPlugin) analyzeIP(ipAddr string) *analysisResult {
 	result := &analysisResult{
@@ -496,7 +370,6 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 	var ipAddr string
 	var virtualHost string
 	var disconnect func(c.Component)
-	var rawConn net.Conn
 
 	// IP-Adresse und Verbindung aus Event extrahieren
 	switch eventType := e.(type) {
@@ -505,16 +378,10 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 			ipAddr = extractIP(player.RemoteAddr())
 			virtualHost = player.VirtualHost().String()
 			disconnect = player.Disconnect
-			
-			// Versuche rohe Verbindung zu extrahieren für direkte Disconnect-Nachricht
-			if connProvider, ok := player.(interface{ Conn() net.Conn }); ok {
-				rawConn = connProvider.Conn()
-			}
 		}
 	default:
 		ipAddr = tryGetRemoteAddr(e)
 		virtualHost = tryGetVirtualHost(e)
-		rawConn = tryGetRawConnection(e)
 	}
 
 	if ipAddr == "" {
@@ -579,20 +446,8 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 			return
 		}
 
-		// Methode 3: Fallback - Sende direkte Minecraft-Disconnect-Nachricht über rohe Verbindung
-		if rawConn != nil {
-			p.log.Info("Sende direkte Disconnect-Nachricht", "ip", ipAddr)
-			if err := p.sendDisconnectMessage(rawConn, p.blockMessage); err != nil {
-				p.log.Error(err, "Fehler beim Senden der Disconnect-Nachricht", "ip", ipAddr)
-			}
-			// Schließe Verbindung nach kurzer Verzögerung
-			go func() {
-				time.Sleep(200 * time.Millisecond)
-				rawConn.Close()
-			}()
-		} else {
-			p.log.Info("Keine Disconnect-Methode verfügbar, Verbindung wird stumm geschlossen", "ip", ipAddr)
-		}
+		// Fallback: Log, dass keine Disconnect-Methode verfügbar ist
+		p.log.Info("Keine Disconnect-Methode verfügbar", "ip", ipAddr)
 	}
 }
 
@@ -1051,55 +906,6 @@ func tryGetVirtualHost(e interface{}) string {
 	}
 
 	return "unbekannt"
-}
-
-func tryGetRawConnection(e interface{}) net.Conn {
-	// Versuche, die rohe Netzwerkverbindung aus verschiedenen Event-Typen zu extrahieren
-	
-	// 1. Direkte Verbindung
-	if conn, ok := e.(net.Conn); ok {
-		return conn
-	}
-	
-	// 2. Über Conn()-Methode
-	type connProvider interface {
-		Conn() net.Conn
-	}
-	if provider, ok := e.(connProvider); ok {
-		return provider.Conn()
-	}
-	
-	// 3. Über Connection()-Methode
-	type connectionProvider interface {
-		Connection() interface{ Conn() net.Conn }
-	}
-	if provider, ok := e.(connectionProvider); ok {
-		if conn := provider.Connection(); conn != nil {
-			return conn.Conn()
-		}
-	}
-	
-	// 4. Über InitialConnection()-Methode  
-	type initialConnectionProvider interface {
-		InitialConnection() interface{ Conn() net.Conn }
-	}
-	if provider, ok := e.(initialConnectionProvider); ok {
-		if conn := provider.InitialConnection(); conn != nil {
-			return conn.Conn()
-		}
-	}
-	
-	// 5. Über Player()-Methode
-	type playerProvider interface {
-		Player() interface{ Conn() net.Conn }
-	}
-	if provider, ok := e.(playerProvider); ok {
-		if player := provider.Player(); player != nil {
-			return player.Conn()
-		}
-	}
-	
-	return nil
 }
 
 func tryDisconnect(e interface{}, reason c.Component) bool {
