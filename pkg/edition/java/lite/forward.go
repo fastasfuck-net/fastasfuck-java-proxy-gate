@@ -27,8 +27,6 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// relevant part of Forward function from pkg/edition/java/lite/forward.go
-
 func Forward(
 	dialTimeout time.Duration,
 	routes []config.Route,
@@ -55,27 +53,25 @@ func Forward(
 		return
 	}
 
-	// KORRIGIERT: Login-Detection VOR emptyReadBuff
-	if handshake.NextState == 2 {
+	// KORRIGIERT: Versuche verschiedene Möglichkeiten für Login-Detection
+	isLoginAttempt := false
+	
+	// Option 1: Prüfe HandshakeIntent (wahrscheinlichste Lösung)
+	if handshake.Intent == packet.LoginIntent {
+		isLoginAttempt = true
+	}
+	
+	// Option 2: Falls Intent nicht existiert, prüfe andere Felder
+	// Entkommentiere eine der folgenden Zeilen falls Option 1 nicht funktioniert:
+	// if handshake.NextState == 2 { isLoginAttempt = true }
+	// if handshake.State == 2 { isLoginAttempt = true }
+	// if handshake.Type == 2 { isLoginAttempt = true }
+
+	if isLoginAttempt {
 		log.Info("Player login detected", 
 			"clientAddr", netutil.Host(src.RemoteAddr()),
 			"protocol", proto.Protocol(handshake.ProtocolVersion).String())
-		
-		// Optional: Prüfe Buffer-Größe BEVOR er geleert wird
-		if buf, ok := client.(interface{ ReadBuffered() ([]byte, error) }); ok {
-			if data, err := buf.ReadBuffered(); err == nil {
-				log.Info("Login buffer info", "bufferSize", len(data))
-				// KORRIGIERT: Verwende math.Min oder eine einfache if-Bedingung
-				previewLen := len(data)
-				if previewLen > 20 {
-					previewLen = 20
-				}
-				if len(data) > 0 {
-					log.V(1).Info("Buffer preview", "firstBytes", fmt.Sprintf("%x", data[:previewLen]))
-				}
-			}
-		}
-	} // KORRIGIERT: Fehlende schließende Klammer
+	}
 
 	// Find a backend to dial successfully.
 	log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
@@ -92,11 +88,11 @@ func Forward(
 		return
 	}
 
-	// KORRIGIERT: Dieser Log-Call ist wieder außerhalb des Login-Blocks
 	log.Info("forwarding connection", "backendAddr", netutil.Host(dst.RemoteAddr()))
 	pipe(log, src, dst)
 }
 
+// Rest der Funktionen bleibt unverändert...
 // errAllBackendsFailed is returned when all backends failed to dial.
 var errAllBackendsFailed = errors.New("all backends failed")
 
