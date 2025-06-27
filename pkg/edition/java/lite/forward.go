@@ -70,6 +70,23 @@ func Forward(
 		return
 	}
 
+	if handshake.NextState == 2 {
+        log.Info("Player login detected", 
+            "clientAddr", netutil.Host(src.RemoteAddr()),
+            "protocol", proto.Protocol(handshake.ProtocolVersion).String())
+        
+        // Optional: Warte kurz und logge Buffer-Größe
+        time.Sleep(10 * time.Millisecond)
+        if buf, ok := client.(interface{ ReadBuffered() ([]byte, error) }); ok {
+            if data, err := buf.ReadBuffered(); err == nil {
+                log.Info("Login buffer info", "bufferSize", len(data))
+                // Hier könntest du den ersten Teil des Buffers loggen
+                if len(data) > 0 {
+                    log.V(1).Info("Buffer preview", "firstBytes", fmt.Sprintf("%x", data[:min(20, len(data))]))
+                }
+            }
+        }
+
 	log.Info("forwarding connection", "backendAddr", netutil.Host(dst.RemoteAddr()))
 	pipe(log, src, dst)
 }
