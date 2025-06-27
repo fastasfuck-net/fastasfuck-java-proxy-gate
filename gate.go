@@ -13,7 +13,6 @@ func main() {
 	proxy.Plugins = append(proxy.Plugins,
 		ipblacklist.Plugin,
 		configdownloader.Plugin,
-		joinnotifier.Plugin,
 		antivpn.Plugin,
 	)
 	
