@@ -27,6 +27,8 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// relevant part of Forward function from pkg/edition/java/lite/forward.go
+
 func Forward(
 	dialTimeout time.Duration,
 	routes []config.Route,
@@ -53,7 +55,7 @@ func Forward(
 		return
 	}
 
-	// EINFACHE LÖSUNG: Logge alle Verbindungen mit Debug-Info
+	// NEU: Einfache Verbindungs-Detection
 	log.Info("Connection attempt detected", 
 		"clientAddr", netutil.Host(src.RemoteAddr()),
 		"protocol", proto.Protocol(handshake.ProtocolVersion).String(),
