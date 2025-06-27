@@ -2,13 +2,17 @@ package proxy
 
 import (
 	"bytes"
+
 	"github.com/go-logr/logr"
 	"github.com/robinbraemer/event"
+	"go.minekube.com/gate/pkg/edition/java/netmc"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet/config"
+	"go.minekube.com/gate/pkg/edition/java/proto/packet/cookie"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet/plugin"
 	"go.minekube.com/gate/pkg/edition/java/proto/state"
 	"go.minekube.com/gate/pkg/edition/java/proto/util"
+	"go.minekube.com/gate/pkg/edition/java/proxy/bungeecord"
 	"go.minekube.com/gate/pkg/edition/java/proxy/internal/resourcepack"
 	"go.minekube.com/gate/pkg/gate/proto"
 	"go.minekube.com/gate/pkg/internal/future"
@@ -67,6 +71,8 @@ func (h *clientConfigSessionHandler) HandlePacket(pc *proto.PacketContext) {
 		}
 	case *config.KnownPacks:
 		h.handleKnownPacks(p, pc)
+	case *cookie.CookieResponse:
+		h.handleCookieResponse(p)
 	default:
 		forwardToServer(pc, h.player)
 	}
@@ -123,11 +129,38 @@ func (h *clientConfigSessionHandler) handlePluginMessage(p *plugin.Message) {
 		})
 		// Client sends `minecraft:brand` packet immediately after Login,
 		// but at this time the backend server may not be ready
+	} else if bungeecord.IsBungeeCordMessage(p) {
+		return
 	} else {
-		smc, ok := serverConn.ensureConnected()
-		if ok {
-			_ = smc.WritePacket(p)
+		id, ok := h.player.proxy.ChannelRegistrar().FromID(p.Channel)
+		if !ok {
+			smc, ok := serverConn.ensureConnected()
+			if ok {
+				_ = smc.WritePacket(p)
+			}
+			return
 		}
+
+		// Handling this stuff async means that we should probably pause
+		// the connection while we toss this off into another pool
+		serverConn.player.SetAutoReading(false)
+		event.FireParallel(h.event(), &PluginMessageEvent{
+			source:     serverConn,
+			target:     h.player,
+			identifier: id,
+			data:       p.Data,
+		}, func(pme *PluginMessageEvent) {
+			if pme.Allowed() && serverConn.active() {
+				smc, ok := serverConn.ensureConnected()
+				if ok {
+					_ = smc.WritePacket(&plugin.Message{
+						Channel: p.Channel,
+						Data:    pme.data,
+					})
+				}
+			}
+			serverConn.player.SetAutoReading(true)
+		})
 	}
 }
 
@@ -140,4 +173,32 @@ func (h *clientConfigSessionHandler) handleKnownPacks(p *config.KnownPacks, pc *
 
 func (h *clientConfigSessionHandler) event() event.Manager {
 	return h.player.proxy.Event()
+}
+
+func (h *clientConfigSessionHandler) handleCookieResponse(p *cookie.CookieResponse) {
+	e := newCookieReceiveEvent(h.player, p.Key, p.Payload)
+	h.event().Fire(e)
+	if !e.Allowed() {
+		return
+	}
+	smc, ok := h.player.connectionInFlightOrConnectedServer().ensureConnected()
+	if !ok {
+		return
+	}
+	forwardCookieReceive(e, smc)
+}
+
+func forwardCookieReceive(e *CookieReceiveEvent, conn netmc.MinecraftConn) {
+	key := e.Key()
+	if key == nil {
+		key = e.OriginalKey()
+	}
+	payload := e.Payload()
+	if payload == nil {
+		payload = e.OriginalPayload()
+	}
+	_ = conn.WritePacket(&cookie.CookieResponse{
+		Key:     key,
+		Payload: payload,
+	})
 }

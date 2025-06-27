@@ -3,17 +3,20 @@ package proxy
 import (
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/go-logr/logr"
+	"github.com/robinbraemer/event"
 	"go.minekube.com/gate/pkg/edition/java/netmc"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet/config"
+	"go.minekube.com/gate/pkg/edition/java/proto/packet/cookie"
 	"go.minekube.com/gate/pkg/edition/java/proto/packet/plugin"
 	"go.minekube.com/gate/pkg/edition/java/proto/state"
 	"go.minekube.com/gate/pkg/edition/java/proto/version"
 	"go.minekube.com/gate/pkg/edition/java/proxy/tablist"
 	"go.minekube.com/gate/pkg/gate/proto"
 	"go.minekube.com/gate/pkg/util/uuid"
-	"time"
 )
 
 // backendConfigSessionHandler is a special session handler that catches "last minute" disconnects.
@@ -88,6 +91,10 @@ func (b *backendConfigSessionHandler) HandlePacket(pc *proto.PacketContext) {
 		b.requestCtx.result(result, nil)
 	case *packet.Transfer:
 		b.handleTransfer(p)
+	case *cookie.CookieStore:
+		b.handleCookieStore(p)
+	case *cookie.CookieRequest:
+		b.handleCookieRequest(p)
 	default:
 		b.forwardToPlayer(pc, nil)
 	}
@@ -207,13 +214,79 @@ func (b *backendConfigSessionHandler) handlePluginMessage(pc *proto.PacketContex
 		_ = b.serverConn.player.WritePacket(plugin.RewriteMinecraftBrand(p,
 			b.serverConn.player.Protocol()))
 	} else {
-		b.forwardToPlayer(pc, nil)
+		bytes := pc.Payload
+		id, ok := b.proxy().ChannelRegistrar().FromID(p.Channel)
+		if !ok {
+			b.forwardToPlayer(pc, nil)
+			return
+		}
+
+		// Handling this stuff async means that we should probably pause
+		// the connection while we toss this off into another pool
+		b.serverConn.connection.SetAutoReading(false)
+		event.FireParallel(b.proxy().Event(), &PluginMessageEvent{
+			source:     b.serverConn,
+			target:     b.serverConn.player,
+			identifier: id,
+			data:       bytes,
+		}, func(pme *PluginMessageEvent) {
+			if pme.Allowed() && b.serverConn.active() {
+				b.forwardToPlayer(pc, &plugin.Message{
+					Channel: p.Channel,
+					Data:    pme.Data(),
+				})
+			}
+			b.serverConn.connection.SetAutoReading(true)
+		})
 	}
 }
 
 func (b *backendConfigSessionHandler) handleKeepAlive(p *packet.KeepAlive) {
 	b.serverConn.pendingPings.Set(p.RandomID, time.Now())
 	_ = b.serverConn.player.WritePacket(p)
+}
+
+func (b *backendConfigSessionHandler) handleCookieRequest(p *cookie.CookieRequest) {
+	e := newCookieRequestEvent(b.serverConn.player, p.Key)
+	b.proxy().event.Fire(e)
+	if !e.Allowed() {
+		return
+	}
+	forwardCookieRequest(e, b.serverConn.player)
+}
+
+func forwardCookieRequest(e *CookieRequestEvent, conn netmc.MinecraftConn) {
+	key := e.Key()
+	if key == nil {
+		key = e.OriginalKey()
+	}
+	_ = conn.WritePacket(&cookie.CookieRequest{
+		Key: key,
+	})
+}
+
+func (b *backendConfigSessionHandler) handleCookieStore(p *cookie.CookieStore) {
+	e := newCookieStoreEvent(b.serverConn.player, p.Key, p.Payload)
+	b.proxy().event.Fire(e)
+	if !e.Allowed() {
+		return
+	}
+	forwardCookieStore(e, b.serverConn.player)
+}
+
+func forwardCookieStore(e *CookieStoreEvent, conn netmc.MinecraftConn) {
+	key := e.Key()
+	if key == nil {
+		key = e.OriginalKey()
+	}
+	payload := e.Payload()
+	if payload == nil {
+		payload = e.OriginalPayload()
+	}
+	_ = conn.WritePacket(&cookie.CookieStore{
+		Key:     key,
+		Payload: payload,
+	})
 }
 
 // forwardToPlayer forwards packets to the player. It prefers PacketContext over Packet.
