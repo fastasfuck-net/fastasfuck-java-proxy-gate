@@ -213,7 +213,7 @@ func varIntBytes(value int) int {
 	}
 	bytes := 0
 	for value != 0 {
-		value >>>= 7
+		value >>= 7
 		bytes++
 	}
 	return bytes
