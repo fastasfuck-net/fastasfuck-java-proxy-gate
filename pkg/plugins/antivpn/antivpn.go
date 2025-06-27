@@ -56,6 +56,7 @@ var Plugin = proxy.Plugin{
 			ispRegexList:    make([]*regexp.Regexp, 0),
 			blockedIPs:      make(map[string]bool),
 			whoisCache:      make(map[string]*whoisResult),
+			activeConnections: make(map[string]net.Conn),
 			
 			// Statistiken initialisieren
 			stats: &connectionStats{
@@ -86,13 +87,16 @@ var Plugin = proxy.Plugin{
 			go plugin.startStatsLogger(ctx)
 		}
 
-		// Event-Handler registrieren
+		// Event-Handler registrieren - Diese werden ZUERST ausgeführt
 		event.Subscribe(p.Event(), 0, func(e event.Event) {
 			plugin.handleEvent(e)
 		})
 
-		// Registriere die IP-Check-Funktion für Gate Lite
-		blacklist.RegisterIPCheckFunc(plugin.isBlocked)
+		// Registriere eine einfache IP-Check-Funktion für Gate Lite (immer false, da wir Events verwenden)
+		blacklist.RegisterIPCheckFunc(func(ipAddr string) bool {
+			// Wir lassen das Blacklist-System passieren und handhaben VPN/Proxy über Events
+			return false
+		})
 
 		log.Info("VPN/Proxy Detection Plugin erfolgreich initialisiert!",
 			"asnListURLs", len(plugin.asnListURLs),
@@ -131,6 +135,10 @@ type vpnProxyPlugin struct {
 	stats          *connectionStats
 	statsMutex     sync.RWMutex
 	statsStartTime time.Time
+	
+	// Aktive Verbindungen für Disconnect-Nachrichten
+	activeConnections map[string]net.Conn
+	connMutex        sync.RWMutex
 }
 
 type whoisResult struct {
@@ -200,6 +208,98 @@ func (p *vpnProxyPlugin) isBlocked(ipAddr string) bool {
 	}
 
 	return false
+}
+
+// sendDisconnectMessage sendet eine ordentliche Minecraft-Disconnect-Nachricht
+func (p *vpnProxyPlugin) sendDisconnectMessage(conn net.Conn, message string) error {
+	// JSON-Nachricht für Minecraft formatieren
+	disconnectMsg := map[string]interface{}{
+		"text": message,
+		"color": "red",
+	}
+	
+	jsonMsg, err := json.Marshal(disconnectMsg)
+	if err != nil {
+		return err
+	}
+
+	// Packet ID für Disconnect (in Login State = 0x00)
+	packetID := byte(0x00)
+	
+	// JSON-String-Länge als VarInt
+	jsonLen := len(jsonMsg)
+	
+	// Berechne Paket-Länge (Packet ID + String Length VarInt + String)
+	packetLen := 1 + getVarIntSize(jsonLen) + jsonLen
+	
+	// Buffer für das komplette Paket
+	buf := make([]byte, getVarIntSize(packetLen)+packetLen)
+	offset := 0
+	
+	// Schreibe Paket-Länge als VarInt
+	offset += writeVarInt(buf[offset:], packetLen)
+	
+	// Schreibe Packet ID
+	buf[offset] = packetID
+	offset++
+	
+	// Schreibe JSON-String-Länge als VarInt
+	offset += writeVarInt(buf[offset:], jsonLen)
+	
+	// Schreibe JSON-String
+	copy(buf[offset:], jsonMsg)
+	
+	// Sende das Paket
+	_, err = conn.Write(buf)
+	if err != nil {
+		return err
+	}
+	
+	// Kurz warten damit die Nachricht ankommt
+	time.Sleep(100 * time.Millisecond)
+	
+	return nil
+}
+
+// Hilfsfunktionen für VarInt-Encoding
+func getVarIntSize(value int) int {
+	if value == 0 {
+		return 1
+	}
+	size := 0
+	for value > 0 {
+		value >>= 7
+		size++
+	}
+	return size
+}
+
+func writeVarInt(buf []byte, value int) int {
+	written := 0
+	for {
+		if (value & 0x80) == 0 {
+			buf[written] = byte(value)
+			written++
+			break
+		}
+		buf[written] = byte(value&0x7F | 0x80)
+		written++
+		value >>= 7
+	}
+	return written
+}
+
+// sendDisconnectToConnection sendet eine Disconnect-Nachricht direkt an eine Verbindung
+func (p *vpnProxyPlugin) sendDisconnectToConnection(conn net.Conn, ipAddr string) {
+	// Versuche eine ordentliche Minecraft-Disconnect-Nachricht zu senden
+	if err := p.sendDisconnectMessage(conn, p.blockMessage); err != nil {
+		p.log.V(1).Info("Fehler beim Senden der Disconnect-Nachricht", "ip", ipAddr, "error", err)
+	}
+	
+	// Schließe die Verbindung nach kurzer Verzögerung
+	time.AfterFunc(200*time.Millisecond, func() {
+		conn.Close()
+	})
 }
 
 // analyzeIP führt eine umfassende Analyse einer IP-Adresse durch
@@ -385,23 +485,30 @@ func (p *vpnProxyPlugin) performWhoisLookup(ipAddr string) *whoisResult {
 	return result
 }
 
-// handleEvent verarbeitet Events
+// handleEvent verarbeitet Events und sendet ordentliche Disconnect-Nachrichten
 func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 	var ipAddr string
 	var virtualHost string
 	var disconnect func(c.Component)
+	var rawConn net.Conn
 
-	// IP-Adresse aus Event extrahieren
+	// IP-Adresse und Verbindung aus Event extrahieren
 	switch eventType := e.(type) {
 	case *proxy.LoginEvent:
 		if player := eventType.Player(); player != nil {
 			ipAddr = extractIP(player.RemoteAddr())
 			virtualHost = player.VirtualHost().String()
 			disconnect = player.Disconnect
+			
+			// Versuche rohe Verbindung zu extrahieren für direkte Disconnect-Nachricht
+			if connProvider, ok := player.(interface{ Conn() net.Conn }); ok {
+				rawConn = connProvider.Conn()
+			}
 		}
 	default:
 		ipAddr = tryGetRemoteAddr(e)
 		virtualHost = tryGetVirtualHost(e)
+		rawConn = tryGetRawConnection(e)
 	}
 
 	if ipAddr == "" {
@@ -442,17 +549,37 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 		}
 	}
 
-	// VPN/Proxy-Prüfung und Blockierung
+	// VPN/Proxy-Prüfung und Blockierung mit ordentlicher Disconnect-Nachricht
 	if result.IsVPN {
 		p.log.Info("VPN/Proxy-Verbindung blockiert",
 			"ip", ipAddr,
 			"virtualHost", virtualHost,
 			"reason", result.DetectionSource)
 
+		// Methode 1: Verwende die Standard-Disconnect-Funktion wenn verfügbar
 		if disconnect != nil {
 			disconnect(&c.Text{Content: p.blockMessage})
+			return
+		}
+
+		// Methode 2: Verwende tryDisconnect für andere Event-Typen
+		if tryDisconnect(e, &c.Text{Content: p.blockMessage}) {
+			return
+		}
+
+		// Methode 3: Fallback - Sende direkte Minecraft-Disconnect-Nachricht über rohe Verbindung
+		if rawConn != nil {
+			p.log.Info("Sende direkte Disconnect-Nachricht", "ip", ipAddr)
+			if err := p.sendDisconnectMessage(rawConn, p.blockMessage); err != nil {
+				p.log.Error(err, "Fehler beim Senden der Disconnect-Nachricht", "ip", ipAddr)
+			}
+			// Schließe Verbindung nach kurzer Verzögerung
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				rawConn.Close()
+			}()
 		} else {
-			tryDisconnect(e, &c.Text{Content: p.blockMessage})
+			p.log.Info("Keine Disconnect-Methode verfügbar, Verbindung wird stumm geschlossen", "ip", ipAddr)
 		}
 	}
 }
@@ -947,32 +1074,96 @@ func tryGetVirtualHost(e interface{}) string {
 	return "unbekannt"
 }
 
-func tryDisconnect(e interface{}, reason c.Component) {
+func tryGetRawConnection(e interface{}) net.Conn {
+	// Versuche, die rohe Netzwerkverbindung aus verschiedenen Event-Typen zu extrahieren
+	
+	// 1. Direkte Verbindung
+	if conn, ok := e.(net.Conn); ok {
+		return conn
+	}
+	
+	// 2. Über Conn()-Methode
+	type connProvider interface {
+		Conn() net.Conn
+	}
+	if provider, ok := e.(connProvider); ok {
+		return provider.Conn()
+	}
+	
+	// 3. Über Connection()-Methode
+	type connectionProvider interface {
+		Connection() interface{ Conn() net.Conn }
+	}
+	if provider, ok := e.(connectionProvider); ok {
+		if conn := provider.Connection(); conn != nil {
+			return conn.Conn()
+		}
+	}
+	
+	// 4. Über InitialConnection()-Methode  
+	type initialConnectionProvider interface {
+		InitialConnection() interface{ Conn() net.Conn }
+	}
+	if provider, ok := e.(initialConnectionProvider); ok {
+		if conn := provider.InitialConnection(); conn != nil {
+			return conn.Conn()
+		}
+	}
+	
+	// 5. Über Player()-Methode
+	type playerProvider interface {
+		Player() interface{ Conn() net.Conn }
+	}
+	if provider, ok := e.(playerProvider); ok {
+		if player := provider.Player(); player != nil {
+			return player.Conn()
+		}
+	}
+	
+	return nil
+}
+
+func tryDisconnect(e interface{}, reason c.Component) bool {
+	// 1. Versuche direkt die Disconnect-Methode aufzurufen
 	type disconnector interface {
 		Disconnect(c.Component)
 	}
 	if d, ok := e.(disconnector); ok {
 		d.Disconnect(reason)
-		return
+		return true
 	}
 
+	// 2. Versuche über Connection/InitialConnection
 	type connectionProvider interface {
 		Connection() interface{ Disconnect(c.Component) }
 	}
 	if provider, ok := e.(connectionProvider); ok {
 		if conn := provider.Connection(); conn != nil {
 			conn.Disconnect(reason)
-			return
+			return true
 		}
 	}
 
+	type initialConnectionProvider interface {
+		InitialConnection() interface{ Disconnect(c.Component) }
+	}
+	if provider, ok := e.(initialConnectionProvider); ok {
+		if conn := provider.InitialConnection(); conn != nil {
+			conn.Disconnect(reason)
+			return true
+		}
+	}
+
+	// 3. Versuche über Player-Methode
 	type playerProvider interface {
 		Player() interface{ Disconnect(c.Component) }
 	}
 	if provider, ok := e.(playerProvider); ok {
 		if player := provider.Player(); player != nil {
 			player.Disconnect(reason)
-			return
+			return true
 		}
 	}
+	
+	return false
 }
