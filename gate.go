@@ -5,7 +5,7 @@ import (
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 	"go.minekube.com/gate/pkg/plugins/ipblacklist"
 	"go.minekube.com/gate/pkg/plugins/configdownloader"
-	"go.minekube.com/gate/pkg/plugins/joinnotifier"
+	"go.minekube.com/gate/pkg/plugins/antivpn"
 )
 
 func main() {
@@ -14,6 +14,7 @@ func main() {
 		ipblacklist.Plugin,
 		configdownloader.Plugin,
 		joinnotifier.Plugin,
+		antivpn.Plugin,
 	)
 	
 	// Start Gate
