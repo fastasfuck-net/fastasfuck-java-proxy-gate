@@ -20,7 +20,7 @@ import (
 	"go.minekube.com/gate/pkg/edition/java/lite/blacklist"
 )
 
-// Plugin ist ein VPN/Proxy-Erkennungs-Plugin mit MaxMind ASN-Datenbank
+// Plugin ist ein VPN/Proxy-Erkennungs-Plugin
 var Plugin = proxy.Plugin{
 	Name: "VPNProxyDetector",
 	Init: func(ctx context.Context, p *proxy.Proxy) error {
@@ -56,6 +56,15 @@ var Plugin = proxy.Plugin{
 			ispRegexList:    make([]*regexp.Regexp, 0),
 			blockedIPs:      make(map[string]bool),
 			whoisCache:      make(map[string]*whoisResult),
+			
+			// Statistiken initialisieren
+			stats: &connectionStats{
+				UniqueIPs:         make(map[string]bool),
+				RecentConnections: make([]connectionLog, 0),
+				TopASNs:          make(map[int]uint64),
+				TopISPs:          make(map[string]uint64),
+			},
+			statsStartTime: time.Now(),
 		}
 
 		if !plugin.enabled {
@@ -88,7 +97,6 @@ var Plugin = proxy.Plugin{
 		log.Info("VPN/Proxy Detection Plugin erfolgreich initialisiert!",
 			"asnListURLs", len(plugin.asnListURLs),
 			"ispListURLs", len(plugin.ispListURLs),
-			"maxmindDB", plugin.maxmindDBPath,
 			"updateInterval", plugin.updateInterval)
 		return nil
 	},
@@ -160,133 +168,6 @@ type connectionLog struct {
 	ISP          string
 }
 
-// MaxMind ASN Record Structure
-type maxmindASNRecord struct {
-	AutonomousSystemNumber       uint   `maxminddb:"autonomous_system_number"`
-	AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"`
-}
-
-// initMaxMindDB initialisiert die MaxMind-Datenbank
-func (p *vpnProxyPlugin) initMaxMindDB(ctx context.Context) {
-	// Prüfe, ob DB-Datei existiert
-	if _, err := os.Stat(p.maxmindDBPath); os.IsNotExist(err) {
-		p.log.Info("MaxMind DB nicht gefunden, lade herunter...", "path", p.maxmindDBPath)
-		if err := p.downloadMaxMindDB(); err != nil {
-			p.log.Error(err, "Fehler beim Herunterladen der MaxMind DB")
-			return
-		}
-	}
-
-	// Lade die Datenbank
-	if err := p.loadMaxMindDB(); err != nil {
-		p.log.Error(err, "Fehler beim Laden der MaxMind DB")
-	}
-}
-
-// downloadMaxMindDB lädt die MaxMind-Datenbank herunter
-func (p *vpnProxyPlugin) downloadMaxMindDB() error {
-	p.log.Info("Lade MaxMind GeoLite2 ASN-Datenbank herunter...", "url", p.maxmindDBURL)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", p.maxmindDBURL, nil)
-	if err != nil {
-		return fmt.Errorf("fehler beim Erstellen der HTTP-Anfrage: %w", err)
-	}
-
-	req.Header.Set("User-Agent", "VPNProxyDetector/1.0")
-
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("fehler beim Herunterladen: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP-Status: %d", resp.StatusCode)
-	}
-
-	// Erstelle Verzeichnis falls nötig
-	if err := os.MkdirAll(filepath.Dir(p.maxmindDBPath), 0755); err != nil {
-		return fmt.Errorf("fehler beim Erstellen des Verzeichnisses: %w", err)
-	}
-
-	// Temporäre Datei erstellen
-	tempFile := p.maxmindDBPath + ".tmp"
-	file, err := os.Create(tempFile)
-	if err != nil {
-		return fmt.Errorf("fehler beim Erstellen der temporären Datei: %w", err)
-	}
-	defer file.Close()
-
-	// Daten kopieren
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		os.Remove(tempFile)
-		return fmt.Errorf("fehler beim Schreiben der Datei: %w", err)
-	}
-
-	// Atomisch verschieben
-	if err := os.Rename(tempFile, p.maxmindDBPath); err != nil {
-		os.Remove(tempFile)
-		return fmt.Errorf("fehler beim Verschieben der Datei: %w", err)
-	}
-
-	p.log.Info("MaxMind DB erfolgreich heruntergeladen", "path", p.maxmindDBPath)
-	return nil
-}
-
-// loadMaxMindDB lädt die MaxMind-Datenbank in den Speicher
-func (p *vpnProxyPlugin) loadMaxMindDB() error {
-	db, err := maxminddb.Open(p.maxmindDBPath)
-	if err != nil {
-		return fmt.Errorf("fehler beim Öffnen der MaxMind DB: %w", err)
-	}
-
-	p.maxmindMutex.Lock()
-	if p.maxmindDB != nil {
-		p.maxmindDB.Close()
-	}
-	p.maxmindDB = db
-	p.maxmindMutex.Unlock()
-
-	p.log.Info("MaxMind DB erfolgreich geladen", 
-		"path", p.maxmindDBPath,
-		"buildTime", db.Metadata.BuildEpoch.Format(time.RFC3339))
-	
-	return nil
-}
-
-// getASNFromMaxMind holt ASN-Informationen aus der MaxMind-Datenbank
-func (p *vpnProxyPlugin) getASNFromMaxMind(ipAddr string) *maxmindASNRecord {
-	ip := net.ParseIP(ipAddr)
-	if ip == nil {
-		return nil
-	}
-
-	p.maxmindMutex.RLock()
-	defer p.maxmindMutex.RUnlock()
-
-	if p.maxmindDB == nil {
-		return nil
-	}
-
-	var record maxmindASNRecord
-	err := p.maxmindDB.Lookup(ip, &record)
-	if err != nil {
-		p.log.V(2).Info("MaxMind-Lookup fehlgeschlagen", "ip", ipAddr, "error", err)
-		return nil
-	}
-
-	if record.AutonomousSystemNumber == 0 {
-		return nil
-	}
-
-	return &record
-}
-
 // isBlocked prüft, ob eine IP als VPN/Proxy erkannt wird
 func (p *vpnProxyPlugin) isBlocked(ipAddr string) bool {
 	if ipAddr == "" {
@@ -314,9 +195,7 @@ func (p *vpnProxyPlugin) isBlocked(ipAddr string) bool {
 			"ispMatch", result.ISPMatch,
 			"ipListed", result.IPListed,
 			"asn", result.ASN,
-			"asnOrg", result.ASNOrg,
-			"isp", result.ISP,
-			"source", result.DetectionSource)
+			"isp", result.ISP)
 		return true
 	}
 
@@ -404,7 +283,7 @@ type analysisResult struct {
 	DetectionSource string
 }
 
-// getWhoisData holt WHOIS-Daten mit Caching (Fallback für MaxMind)
+// getWhoisData holt WHOIS-Daten mit Caching
 func (p *vpnProxyPlugin) getWhoisData(ipAddr string) *whoisResult {
 	// Cache prüfen
 	p.cacheMutex.RLock()
@@ -447,7 +326,7 @@ func (p *vpnProxyPlugin) performWhoisLookup(ipAddr string) *whoisResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Verwende ipapi.co als Fallback-Service
+	// Verwende ipapi.co als Service
 	url := fmt.Sprintf("https://ipapi.co/%s/json/", ipAddr)
 	
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -964,7 +843,7 @@ func wildcardToRegex(pattern string) *regexp.Regexp {
 	return regex
 }
 
-// Hilfsfunktionen (aus dem ursprünglichen Plugin übernommen)
+// Hilfsfunktionen
 
 func extractIP(addr net.Addr) string {
 	if addr == nil {
