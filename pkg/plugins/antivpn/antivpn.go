@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,13 +16,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/oschwald/maxminddb-golang"
 	"github.com/robinbraemer/event"
 	c "go.minekube.com/common/minecraft/component"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 	"go.minekube.com/gate/pkg/edition/java/lite/blacklist"
 )
 
-// Plugin ist ein VPN/Proxy-Erkennungs-Plugin
+// Plugin ist ein VPN/Proxy-Erkennungs-Plugin mit MaxMind ASN-Datenbank
 var Plugin = proxy.Plugin{
 	Name: "VPNProxyDetector",
 	Init: func(ctx context.Context, p *proxy.Proxy) error {
@@ -41,9 +44,20 @@ var Plugin = proxy.Plugin{
 			},
 			ipListURL: "https://raw.githubusercontent.com/fastasfuck-net/VPN-List/refs/heads/main/IP.txt",
 			
-			updateInterval: 5 * time.Minute, // Update-Intervall für Listen
-			blockMessage:   "VPN/Proxy connections are not allowed on this server\nPlease disconnect from your VPN/Proxy and try again",
-			enabled:        true,
+			// MaxMind Konfiguration
+			maxmindDBURL:  "https://git.io/GeoLite2-ASN.mmdb",
+			maxmindDBPath: "./GeoLite2-ASN.mmdb",
+			
+			updateInterval:    5 * time.Minute,  // Listen-Updates
+			dbUpdateInterval:  24 * time.Hour,   // DB-Updates (täglich)
+			blockMessage:      "VPN/Proxy connections are not allowed on this server\nPlease disconnect from your VPN/Proxy and try again",
+			enabled:           true,
+			
+			// Logging-Konfiguration
+			logAllConnections:    true,  // Alle Verbindungen loggen
+			logBlockedOnly:       false, // Nur blockierte Verbindungen loggen
+			logDetailedAnalysis:  true,  // Detaillierte Analyse-Ergebnisse loggen
+			logConnectionStats:   true,  // Verbindungsstatistiken loggen
 			
 			// Interne Maps
 			asnRegexList:    make([]*regexp.Regexp, 0),
@@ -63,8 +77,17 @@ var Plugin = proxy.Plugin{
 			log.Error(err, "Fehler beim Initialisieren der lokalen Blacklists")
 		}
 
+		// Starte MaxMind DB-Initialisierung
+		go plugin.initMaxMindDB(ctx)
+
 		// Starte den Update-Prozess im Hintergrund
 		go plugin.startListUpdater(ctx)
+		go plugin.startDBUpdater(ctx)
+		
+		// Starte Statistik-Logger wenn aktiviert
+		if plugin.logConnectionStats {
+			go plugin.startStatsLogger(ctx)
+		}
 
 		// Event-Handler registrieren
 		event.Subscribe(p.Event(), 0, func(e event.Event) {
@@ -77,6 +100,7 @@ var Plugin = proxy.Plugin{
 		log.Info("VPN/Proxy Detection Plugin erfolgreich initialisiert!",
 			"asnListURLs", len(plugin.asnListURLs),
 			"ispListURLs", len(plugin.ispListURLs),
+			"maxmindDB", plugin.maxmindDBPath,
 			"updateInterval", plugin.updateInterval)
 		return nil
 	},
@@ -86,12 +110,25 @@ type vpnProxyPlugin struct {
 	log            logr.Logger
 	
 	// Konfiguration
-	asnListURLs    []string
-	ispListURLs    []string
-	ipListURL      string
-	updateInterval time.Duration
-	blockMessage   string
-	enabled        bool
+	asnListURLs         []string
+	ispListURLs         []string
+	ipListURL           string
+	maxmindDBURL        string
+	maxmindDBPath       string
+	updateInterval      time.Duration
+	dbUpdateInterval    time.Duration
+	blockMessage        string
+	enabled             bool
+	
+	// Logging-Konfiguration
+	logAllConnections   bool
+	logBlockedOnly      bool
+	logDetailedAnalysis bool
+	logConnectionStats  bool
+	
+	// MaxMind DB
+	maxmindDB      *maxminddb.Reader
+	maxmindMutex   sync.RWMutex
 	
 	// Listen und Caches
 	asnRegexList   []*regexp.Regexp
@@ -100,6 +137,11 @@ type vpnProxyPlugin struct {
 	whoisCache     map[string]*whoisResult
 	listMutex      sync.RWMutex
 	cacheMutex     sync.RWMutex
+	
+	// Statistiken
+	stats          *connectionStats
+	statsMutex     sync.RWMutex
+	statsStartTime time.Time
 }
 
 type whoisResult struct {
@@ -107,6 +149,162 @@ type whoisResult struct {
 	ASN       int
 	ASNOrg    string
 	CacheTime time.Time
+}
+
+// Verbindungsstatistiken
+type connectionStats struct {
+	TotalConnections    uint64
+	BlockedConnections  uint64
+	AllowedConnections  uint64
+	VPNByASN           uint64
+	VPNByISP           uint64
+	VPNByIP            uint64
+	WhoisLookups       uint64
+	MaxMindLookups     uint64
+	CacheHits          uint64
+	UniqueIPs          map[string]bool
+	RecentConnections  []connectionLog
+	TopASNs            map[int]uint64
+	TopISPs            map[string]uint64
+}
+
+// Einzelne Verbindungslog-Einträge
+type connectionLog struct {
+	Timestamp    time.Time
+	IP           string
+	VirtualHost  string
+	IsBlocked    bool
+	DetectionSource string
+	ASN          int
+	ASNOrg       string
+	ISP          string
+}
+
+// MaxMind ASN Record Structure
+type maxmindASNRecord struct {
+	AutonomousSystemNumber       uint   `maxminddb:"autonomous_system_number"`
+	AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"`
+}
+
+// initMaxMindDB initialisiert die MaxMind-Datenbank
+func (p *vpnProxyPlugin) initMaxMindDB(ctx context.Context) {
+	// Prüfe, ob DB-Datei existiert
+	if _, err := os.Stat(p.maxmindDBPath); os.IsNotExist(err) {
+		p.log.Info("MaxMind DB nicht gefunden, lade herunter...", "path", p.maxmindDBPath)
+		if err := p.downloadMaxMindDB(); err != nil {
+			p.log.Error(err, "Fehler beim Herunterladen der MaxMind DB")
+			return
+		}
+	}
+
+	// Lade die Datenbank
+	if err := p.loadMaxMindDB(); err != nil {
+		p.log.Error(err, "Fehler beim Laden der MaxMind DB")
+	}
+}
+
+// downloadMaxMindDB lädt die MaxMind-Datenbank herunter
+func (p *vpnProxyPlugin) downloadMaxMindDB() error {
+	p.log.Info("Lade MaxMind GeoLite2 ASN-Datenbank herunter...", "url", p.maxmindDBURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", p.maxmindDBURL, nil)
+	if err != nil {
+		return fmt.Errorf("fehler beim Erstellen der HTTP-Anfrage: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "VPNProxyDetector/1.0")
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fehler beim Herunterladen: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP-Status: %d", resp.StatusCode)
+	}
+
+	// Erstelle Verzeichnis falls nötig
+	if err := os.MkdirAll(filepath.Dir(p.maxmindDBPath), 0755); err != nil {
+		return fmt.Errorf("fehler beim Erstellen des Verzeichnisses: %w", err)
+	}
+
+	// Temporäre Datei erstellen
+	tempFile := p.maxmindDBPath + ".tmp"
+	file, err := os.Create(tempFile)
+	if err != nil {
+		return fmt.Errorf("fehler beim Erstellen der temporären Datei: %w", err)
+	}
+	defer file.Close()
+
+	// Daten kopieren
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		os.Remove(tempFile)
+		return fmt.Errorf("fehler beim Schreiben der Datei: %w", err)
+	}
+
+	// Atomisch verschieben
+	if err := os.Rename(tempFile, p.maxmindDBPath); err != nil {
+		os.Remove(tempFile)
+		return fmt.Errorf("fehler beim Verschieben der Datei: %w", err)
+	}
+
+	p.log.Info("MaxMind DB erfolgreich heruntergeladen", "path", p.maxmindDBPath)
+	return nil
+}
+
+// loadMaxMindDB lädt die MaxMind-Datenbank in den Speicher
+func (p *vpnProxyPlugin) loadMaxMindDB() error {
+	db, err := maxminddb.Open(p.maxmindDBPath)
+	if err != nil {
+		return fmt.Errorf("fehler beim Öffnen der MaxMind DB: %w", err)
+	}
+
+	p.maxmindMutex.Lock()
+	if p.maxmindDB != nil {
+		p.maxmindDB.Close()
+	}
+	p.maxmindDB = db
+	p.maxmindMutex.Unlock()
+
+	p.log.Info("MaxMind DB erfolgreich geladen", 
+		"path", p.maxmindDBPath,
+		"buildTime", db.Metadata.BuildEpoch.Format(time.RFC3339))
+	
+	return nil
+}
+
+// getASNFromMaxMind holt ASN-Informationen aus der MaxMind-Datenbank
+func (p *vpnProxyPlugin) getASNFromMaxMind(ipAddr string) *maxmindASNRecord {
+	ip := net.ParseIP(ipAddr)
+	if ip == nil {
+		return nil
+	}
+
+	p.maxmindMutex.RLock()
+	defer p.maxmindMutex.RUnlock()
+
+	if p.maxmindDB == nil {
+		return nil
+	}
+
+	var record maxmindASNRecord
+	err := p.maxmindDB.Lookup(ip, &record)
+	if err != nil {
+		p.log.V(2).Info("MaxMind-Lookup fehlgeschlagen", "ip", ipAddr, "error", err)
+		return nil
+	}
+
+	if record.AutonomousSystemNumber == 0 {
+		return nil
+	}
+
+	return &record
 }
 
 // isBlocked prüft, ob eine IP als VPN/Proxy erkannt wird
@@ -136,7 +334,9 @@ func (p *vpnProxyPlugin) isBlocked(ipAddr string) bool {
 			"ispMatch", result.ISPMatch,
 			"ipListed", result.IPListed,
 			"asn", result.ASN,
-			"isp", result.ISP)
+			"asnOrg", result.ASNOrg,
+			"isp", result.ISP,
+			"source", result.DetectionSource)
 		return true
 	}
 
@@ -154,48 +354,77 @@ func (p *vpnProxyPlugin) analyzeIP(ipAddr string) *analysisResult {
 	result.IPListed = p.blockedIPs[ipAddr]
 	p.listMutex.RUnlock()
 
-	// 2. Hole WHOIS-Daten (mit Cache)
-	whoisData := p.getWhoisData(ipAddr)
-	if whoisData != nil {
-		result.ISP = whoisData.ISP
-		result.ASN = whoisData.ASN
-		result.ASNOrg = whoisData.ASNOrg
+	if result.IPListed {
+		result.DetectionSource = "IP-List"
+	}
+
+	// 2. MaxMind ASN-Lookup (prioritär, da lokaler und schneller)
+	if maxmindRecord := p.getASNFromMaxMind(ipAddr); maxmindRecord != nil {
+		result.ASN = int(maxmindRecord.AutonomousSystemNumber)
+		result.ASNOrg = maxmindRecord.AutonomousSystemOrganization
 
 		// 3. Prüfe ASN gegen Liste
-		if whoisData.ASN > 0 {
-			asnStr := fmt.Sprintf("AS%d", whoisData.ASN)
+		asnStr := fmt.Sprintf("AS%d", result.ASN)
+		p.listMutex.RLock()
+		for _, regex := range p.asnRegexList {
+			if regex.MatchString(asnStr) {
+				result.ASNMatch = true
+				result.DetectionSource = "ASN-MaxMind"
+				break
+			}
+		}
+		p.listMutex.RUnlock()
+
+		// 4. Prüfe ASN-Organisation gegen ISP-Liste
+		if !result.ISPMatch && result.ASNOrg != "" {
 			p.listMutex.RLock()
-			for _, regex := range p.asnRegexList {
-				if regex.MatchString(asnStr) {
-					result.ASNMatch = true
+			for _, regex := range p.ispRegexList {
+				if regex.MatchString(result.ASNOrg) {
+					result.ISPMatch = true
+					result.DetectionSource = "ISP-MaxMind"
 					break
 				}
 			}
 			p.listMutex.RUnlock()
 		}
+	}
 
-		// 4. Prüfe ISP gegen Liste
-		if whoisData.ISP != "" {
-			p.listMutex.RLock()
-			for _, regex := range p.ispRegexList {
-				if regex.MatchString(whoisData.ISP) {
-					result.ISPMatch = true
-					break
-				}
+	// 5. Fallback: WHOIS-Lookup (nur wenn MaxMind keine Daten lieferte)
+	if result.ASN == 0 {
+		whoisData := p.getWhoisData(ipAddr)
+		if whoisData != nil {
+			result.ISP = whoisData.ISP
+			if result.ASN == 0 {
+				result.ASN = whoisData.ASN
+				result.ASNOrg = whoisData.ASNOrg
 			}
-			p.listMutex.RUnlock()
-		}
 
-		// 5. Prüfe ASN-Organisation gegen ISP-Liste
-		if !result.ISPMatch && whoisData.ASNOrg != "" {
-			p.listMutex.RLock()
-			for _, regex := range p.ispRegexList {
-				if regex.MatchString(whoisData.ASNOrg) {
-					result.ISPMatch = true
-					break
+			// Prüfe WHOIS-ASN gegen Liste
+			if !result.ASNMatch && whoisData.ASN > 0 {
+				asnStr := fmt.Sprintf("AS%d", whoisData.ASN)
+				p.listMutex.RLock()
+				for _, regex := range p.asnRegexList {
+					if regex.MatchString(asnStr) {
+						result.ASNMatch = true
+						result.DetectionSource = "ASN-WHOIS"
+						break
+					}
 				}
+				p.listMutex.RUnlock()
 			}
-			p.listMutex.RUnlock()
+
+			// Prüfe WHOIS-ISP gegen Liste
+			if !result.ISPMatch && whoisData.ISP != "" {
+				p.listMutex.RLock()
+				for _, regex := range p.ispRegexList {
+					if regex.MatchString(whoisData.ISP) {
+						result.ISPMatch = true
+						result.DetectionSource = "ISP-WHOIS"
+						break
+					}
+				}
+				p.listMutex.RUnlock()
+			}
 		}
 	}
 
@@ -206,17 +435,18 @@ func (p *vpnProxyPlugin) analyzeIP(ipAddr string) *analysisResult {
 }
 
 type analysisResult struct {
-	IP       string
-	IsVPN    bool
-	IPListed bool
-	ASNMatch bool
-	ISPMatch bool
-	ASN      int
-	ASNOrg   string
-	ISP      string
+	IP              string
+	IsVPN           bool
+	IPListed        bool
+	ASNMatch        bool
+	ISPMatch        bool
+	ASN             int
+	ASNOrg          string
+	ISP             string
+	DetectionSource string
 }
 
-// getWhoisData holt WHOIS-Daten mit Caching
+// getWhoisData holt WHOIS-Daten mit Caching (Fallback für MaxMind)
 func (p *vpnProxyPlugin) getWhoisData(ipAddr string) *whoisResult {
 	// Cache prüfen
 	p.cacheMutex.RLock()
@@ -224,6 +454,12 @@ func (p *vpnProxyPlugin) getWhoisData(ipAddr string) *whoisResult {
 		// Cache-Eintrag ist 1 Stunde gültig
 		if time.Since(cached.CacheTime) < time.Hour {
 			p.cacheMutex.RUnlock()
+			
+			// Cache-Hit zählen
+			p.statsMutex.Lock()
+			p.stats.CacheHits++
+			p.statsMutex.Unlock()
+			
 			return cached
 		}
 	}
@@ -245,14 +481,15 @@ func (p *vpnProxyPlugin) getWhoisData(ipAddr string) *whoisResult {
 
 // performWhoisLookup führt eine WHOIS-Abfrage durch
 func (p *vpnProxyPlugin) performWhoisLookup(ipAddr string) *whoisResult {
-	// Vereinfachte WHOIS-Implementierung
-	// In einer echten Implementierung würden Sie eine WHOIS-Bibliothek verwenden
-	
-	// Für dieses Beispiel verwenden wir eine einfache HTTP-Abfrage an einen WHOIS-Service
+	// WHOIS-Lookup zählen
+	p.statsMutex.Lock()
+	p.stats.WhoisLookups++
+	p.statsMutex.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Beispiel-URL für WHOIS-Daten (ersetzen Sie durch einen echten Service)
+	// Verwende ipapi.co als Fallback-Service
 	url := fmt.Sprintf("https://ipapi.co/%s/json/", ipAddr)
 	
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -334,16 +571,55 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 		return
 	}
 
-	p.log.V(1).Info("Verbindung analysiert",
-		"ip", ipAddr,
-		"virtualHost", virtualHost,
-		"eventType", fmt.Sprintf("%T", e))
+	// Führe Analyse durch
+	result := p.analyzeIP(ipAddr)
+	
+	// Statistiken aktualisieren
+	p.updateStats(ipAddr, virtualHost, result)
 
-	// VPN/Proxy-Prüfung
-	if p.isBlocked(ipAddr) {
+	// MaxMind Lookup gezählt?
+	if result.ASN > 0 && result.DetectionSource != "" {
+		p.statsMutex.Lock()
+		if strings.Contains(result.DetectionSource, "MaxMind") {
+			p.stats.MaxMindLookups++
+		}
+		p.statsMutex.Unlock()
+	}
+
+	// Logging basierend auf Konfiguration
+	if p.logAllConnections || (p.logBlockedOnly && result.IsVPN) {
+		if p.logDetailedAnalysis {
+			p.log.Info("Verbindung analysiert",
+				"ip", ipAddr,
+				"virtualHost", virtualHost,
+				"eventType", fmt.Sprintf("%T", e),
+				"isVPN", result.IsVPN,
+				"ipListed", result.IPListed,
+				"asnMatch", result.ASNMatch,
+				"ispMatch", result.ISPMatch,
+				"asn", result.ASN,
+				"asnOrg", result.ASNOrg,
+				"isp", result.ISP,
+				"detectionSource", result.DetectionSource)
+		} else {
+			p.log.Info("Verbindung",
+				"ip", ipAddr,
+				"virtualHost", virtualHost,
+				"status", func() string {
+					if result.IsVPN {
+						return "BLOCKED"
+					}
+					return "ALLOWED"
+				}())
+		}
+	}
+
+	// VPN/Proxy-Prüfung und Blockierung
+	if result.IsVPN {
 		p.log.Info("VPN/Proxy-Verbindung blockiert",
 			"ip", ipAddr,
-			"virtualHost", virtualHost)
+			"virtualHost", virtualHost,
+			"reason", result.DetectionSource)
 
 		if disconnect != nil {
 			disconnect(&c.Text{Content: p.blockMessage})
@@ -351,6 +627,212 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 			tryDisconnect(e, &c.Text{Content: p.blockMessage})
 		}
 	}
+}
+
+// updateStats aktualisiert die Verbindungsstatistiken
+func (p *vpnProxyPlugin) updateStats(ipAddr, virtualHost string, result *analysisResult) {
+	p.statsMutex.Lock()
+	defer p.statsMutex.Unlock()
+
+	// Basis-Statistiken
+	p.stats.TotalConnections++
+	p.stats.UniqueIPs[ipAddr] = true
+
+	if result.IsVPN {
+		p.stats.BlockedConnections++
+		
+		// Detaillierte VPN-Erkennungsstatistiken
+		if result.IPListed {
+			p.stats.VPNByIP++
+		}
+		if result.ASNMatch {
+			p.stats.VPNByASN++
+		}
+		if result.ISPMatch {
+			p.stats.VPNByISP++
+		}
+	} else {
+		p.stats.AllowedConnections++
+	}
+
+	// Top ASNs
+	if result.ASN > 0 {
+		p.stats.TopASNs[result.ASN]++
+	}
+
+	// Top ISPs
+	if result.ISP != "" {
+		p.stats.TopISPs[result.ISP]++
+	} else if result.ASNOrg != "" {
+		p.stats.TopISPs[result.ASNOrg]++
+	}
+
+	// Aktuelle Verbindungen (letzte 100)
+	connectionEntry := connectionLog{
+		Timestamp:       time.Now(),
+		IP:              ipAddr,
+		VirtualHost:     virtualHost,
+		IsBlocked:       result.IsVPN,
+		DetectionSource: result.DetectionSource,
+		ASN:             result.ASN,
+		ASNOrg:          result.ASNOrg,
+		ISP:             result.ISP,
+	}
+
+	p.stats.RecentConnections = append(p.stats.RecentConnections, connectionEntry)
+	
+	// Begrenze auf letzte 100 Verbindungen
+	if len(p.stats.RecentConnections) > 100 {
+		p.stats.RecentConnections = p.stats.RecentConnections[1:]
+	}
+}
+
+// startStatsLogger startet den regelmäßigen Statistik-Logger
+func (p *vpnProxyPlugin) startStatsLogger(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Minute) // Alle 10 Minuten
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.logDetailedStats()
+		case <-ctx.Done():
+			p.log.Info("Statistik-Logger beendet")
+			return
+		}
+	}
+}
+
+// logDetailedStats loggt detaillierte Statistiken
+func (p *vpnProxyPlugin) logDetailedStats() {
+	p.statsMutex.RLock()
+	defer p.statsMutex.RUnlock()
+
+	uptime := time.Since(p.statsStartTime)
+	
+	p.log.Info("=== VPN/Proxy Detection Statistiken ===",
+		"uptime", uptime.Round(time.Minute),
+		"totalConnections", p.stats.TotalConnections,
+		"allowedConnections", p.stats.AllowedConnections,
+		"blockedConnections", p.stats.BlockedConnections,
+		"blockRate", fmt.Sprintf("%.2f%%", float64(p.stats.BlockedConnections)/float64(p.stats.TotalConnections)*100),
+		"uniqueIPs", len(p.stats.UniqueIPs))
+
+	p.log.Info("=== Erkennungsmethoden ===",
+		"vpnByIP", p.stats.VPNByIP,
+		"vpnByASN", p.stats.VPNByASN,
+		"vpnByISP", p.stats.VPNByISP,
+		"maxMindLookups", p.stats.MaxMindLookups,
+		"whoisLookups", p.stats.WhoisLookups,
+		"cacheHits", p.stats.CacheHits)
+
+	// Top 5 ASNs
+	topASNs := p.getTopASNs(5)
+	if len(topASNs) > 0 {
+		p.log.Info("=== Top ASNs ===", "topASNs", topASNs)
+	}
+
+	// Top 5 ISPs
+	topISPs := p.getTopISPs(5)
+	if len(topISPs) > 0 {
+		p.log.Info("=== Top ISPs ===", "topISPs", topISPs)
+	}
+
+	// Letzte 5 blockierte Verbindungen
+	recentBlocked := p.getRecentBlocked(5)
+	if len(recentBlocked) > 0 {
+		p.log.Info("=== Letzte blockierte Verbindungen ===")
+		for i, conn := range recentBlocked {
+			p.log.Info(fmt.Sprintf("  %d.", i+1),
+				"ip", conn.IP,
+				"time", conn.Timestamp.Format("15:04:05"),
+				"reason", conn.DetectionSource,
+				"asn", conn.ASN,
+				"org", conn.ASNOrg)
+		}
+	}
+}
+
+// getTopASNs gibt die Top-N ASNs zurück
+func (p *vpnProxyPlugin) getTopASNs(n int) []string {
+	type asnCount struct {
+		ASN   int
+		Count uint64
+	}
+
+	var asns []asnCount
+	for asn, count := range p.stats.TopASNs {
+		asns = append(asns, asnCount{ASN: asn, Count: count})
+	}
+
+	// Sortiere nach Count (absteigend)
+	for i := 0; i < len(asns)-1; i++ {
+		for j := i + 1; j < len(asns); j++ {
+			if asns[i].Count < asns[j].Count {
+				asns[i], asns[j] = asns[j], asns[i]
+			}
+		}
+	}
+
+	// Limitiere auf Top-N
+	if len(asns) > n {
+		asns = asns[:n]
+	}
+
+	var result []string
+	for _, asnCount := range asns {
+		result = append(result, fmt.Sprintf("AS%d (%d)", asnCount.ASN, asnCount.Count))
+	}
+
+	return result
+}
+
+// getTopISPs gibt die Top-N ISPs zurück
+func (p *vpnProxyPlugin) getTopISPs(n int) []string {
+	type ispCount struct {
+		ISP   string
+		Count uint64
+	}
+
+	var isps []ispCount
+	for isp, count := range p.stats.TopISPs {
+		isps = append(isps, ispCount{ISP: isp, Count: count})
+	}
+
+	// Sortiere nach Count (absteigend)
+	for i := 0; i < len(isps)-1; i++ {
+		for j := i + 1; j < len(isps); j++ {
+			if isps[i].Count < isps[j].Count {
+				isps[i], isps[j] = isps[j], isps[i]
+			}
+		}
+	}
+
+	// Limitiere auf Top-N
+	if len(isps) > n {
+		isps = isps[:n]
+	}
+
+	var result []string
+	for _, ispCount := range isps {
+		result = append(result, fmt.Sprintf("%s (%d)", ispCount.ISP, ispCount.Count))
+	}
+
+	return result
+}
+
+// getRecentBlocked gibt die letzten N blockierten Verbindungen zurück
+func (p *vpnProxyPlugin) getRecentBlocked(n int) []connectionLog {
+	var blocked []connectionLog
+	
+	// Sammle blockierte Verbindungen (rückwärts für neueste zuerst)
+	for i := len(p.stats.RecentConnections) - 1; i >= 0 && len(blocked) < n; i-- {
+		if p.stats.RecentConnections[i].IsBlocked {
+			blocked = append(blocked, p.stats.RecentConnections[i])
+		}
+	}
+
+	return blocked
 }
 
 // startListUpdater startet die regelmäßige Aktualisierung der Listen
@@ -371,6 +853,35 @@ func (p *vpnProxyPlugin) startListUpdater(ctx context.Context) {
 			}
 		case <-ctx.Done():
 			p.log.Info("Listen Updater beendet")
+			return
+		}
+	}
+}
+
+// startDBUpdater startet die regelmäßige Aktualisierung der MaxMind-DB
+func (p *vpnProxyPlugin) startDBUpdater(ctx context.Context) {
+	ticker := time.NewTicker(p.dbUpdateInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.log.Info("Starte tägliches MaxMind DB-Update...")
+			if err := p.downloadMaxMindDB(); err != nil {
+				p.log.Error(err, "MaxMind DB-Update fehlgeschlagen")
+			} else {
+				if err := p.loadMaxMindDB(); err != nil {
+					p.log.Error(err, "MaxMind DB-Neuladen fehlgeschlagen")
+				}
+			}
+		case <-ctx.Done():
+			p.log.Info("DB Updater beendet")
+			// Schließe MaxMind DB
+			p.maxmindMutex.Lock()
+			if p.maxmindDB != nil {
+				p.maxmindDB.Close()
+			}
+			p.maxmindMutex.Unlock()
 			return
 		}
 	}
