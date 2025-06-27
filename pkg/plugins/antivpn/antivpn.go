@@ -303,6 +303,17 @@ func (p *vpnProxyPlugin) analyzeIP(ipAddr string) *analysisResult {
 		IP: ipAddr,
 	}
 
+	// Prüfe, ob es eine gültige IP ist
+	ip := net.ParseIP(ipAddr)
+	if ip == nil {
+		return result
+	}
+
+	// Lokale und private IPs nicht als VPN markieren
+	if ip.IsLoopback() || ip.IsPrivate() {
+		return result
+	}
+
 	// 1. Prüfe gegen IP-Liste
 	p.listMutex.RLock()
 	result.IPListed = p.blockedIPs[ipAddr]
