@@ -1,255 +1,231 @@
-package joinnotifier
+package lite
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"sync"
+	"io"
+	"net"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/robinbraemer/event"
-	"go.minekube.com/common/minecraft/component"
-	"go.minekube.com/common/minecraft/component/codec/legacy"
-	"go.minekube.com/gate/pkg/edition/java/proxy"
-	"go.minekube.com/gate/pkg/util/uuid"
+	"go.minekube.com/gate/pkg/edition/java/lite/blacklist"
+	"go.minekube.com/gate/pkg/edition/java/lite/config"
+	"go.minekube.com/gate/pkg/edition/java/netmc"
+	"go.minekube.com/gate/pkg/edition/java/proto/codec"
+	"go.minekube.com/gate/pkg/edition/java/proto/packet"
+	"go.minekube.com/gate/pkg/edition/java/proto/state"
+	"go.minekube.com/gate/pkg/edition/java/proto/util"
+	"go.minekube.com/gate/pkg/gate/proto"
+	"go.minekube.com/gate/pkg/util/errs"
+	"go.minekube.com/gate/pkg/util/netutil"
 )
 
-// Plugin ist ein Gate-Plugin, das Spielerbeitritte im Chat anzeigt
-var Plugin = proxy.Plugin{
-	Name: "JoinNotifier",
-	Init: func(ctx context.Context, p *proxy.Proxy) error {
-		log := logr.FromContextOrDiscard(ctx)
-		log.Info("Join Notifier Plugin wird initialisiert...")
+// PRAKTISCHER ANSATZ: Modifikation der emptyReadBuff Funktion
+// um Spielernamen zu extrahieren bevor das Backend-Forwarding beginnt
 
-		// Erstelle eine neue Instanz des Plugins
-		plugin := &joinNotifierPlugin{
-			log:           log,
-			proxy:         p,
-			playerCache:   make(map[uuid.UUID]playerInfo),
-			// HIER EINSTELLUNGEN ANPASSEN:
-			enabled:       true,
-			joinMessage:   "&8[&aGatelite&8] &eDer Spieler &b%s &8(&7%s&8) &ehat den Server betreten!",
-			quitMessage:   "&8[&aGatelite&8] &eDer Spieler &b%s &8(&7%s&8) &ehat den Server verlassen!",
-			checkInterval: 3 * time.Second,
-		}
-
-		if !plugin.enabled {
-			log.Info("Join Notifier Plugin ist deaktiviert.")
-			return nil
-		}
-
-		// Registriere spezifische Event-Handler
-		event.Subscribe(p.Event(), 0, plugin.handlePostLogin)
-		event.Subscribe(p.Event(), 0, plugin.handleDisconnect)
-		
-		// Starte einen Hintergrundprozess zur Erkennung von Spieleränderungen (Fallback)
-		go plugin.checkPlayersRegularly(ctx)
-
-		log.Info("Join Notifier Plugin erfolgreich initialisiert!")
-		
-		return nil
-	},
-}
-
-type playerInfo struct {
-	name     string
-	uuid     uuid.UUID
-	joinTime time.Time
-}
-
-type joinNotifierPlugin struct {
-	log           logr.Logger
-	proxy         *proxy.Proxy
-	enabled       bool
-	joinMessage   string // Format: playerName, playerUUID
-	quitMessage   string // Format: playerName, playerUUID
-	checkInterval time.Duration
+func emptyReadBuffWithPlayerName(src netmc.MinecraftConn, dst net.Conn, 
+	log logr.Logger, protocol proto.Protocol, handshake *packet.Handshake) (string, error) {
 	
-	mu           sync.RWMutex
-	playerCache  map[uuid.UUID]playerInfo
+	var playerName string
+	
+	buf, ok := src.(interface{ ReadBuffered() ([]byte, error) })
+	if ok {
+		b, err := buf.ReadBuffered()
+		if err != nil {
+			return "", fmt.Errorf("failed to read buffered bytes: %w", err)
+		}
+		
+		if len(b) != 0 {
+			// Versuche Spielername zu extrahieren bevor wir weiterleiten
+			if handshake.NextState == 2 { // Login state
+				if name, loginPacket, err := extractPlayerNameFromBytes(b, protocol); err == nil {
+					playerName = name
+					log.Info("Extracted player name", "playerName", playerName)
+					
+					// Schreibe das Login-Paket an das Backend
+					_, err = dst.Write(loginPacket)
+					if err != nil {
+						return playerName, fmt.Errorf("failed to write login packet: %w", err)
+					}
+					
+					// Schreibe den Rest des Buffers (falls vorhanden)
+					remainingData := b[len(loginPacket):]
+					if len(remainingData) > 0 {
+						_, err = dst.Write(remainingData)
+						if err != nil {
+							return playerName, fmt.Errorf("failed to write remaining data: %w", err)
+						}
+					}
+				} else {
+					// Fallback: Schreibe alles weiter ohne Namen-Extraktion
+					log.V(1).Info("Could not extract player name", "error", err)
+					_, err = dst.Write(b)
+					if err != nil {
+						return "", fmt.Errorf("failed to write buffered bytes: %w", err)
+					}
+				}
+			} else {
+				// Nicht-Login Pakete: Einfach weiterleiten
+				_, err = dst.Write(b)
+				if err != nil {
+					return "", fmt.Errorf("failed to write buffered bytes: %w", err)
+				}
+			}
+		}
+	}
+	return playerName, nil
 }
 
-// Wandelt einen String in eine component.Component um
-func textComponent(message string) component.Component {
-	legacyParser := &legacy.Legacy{}
-	comp, err := legacyParser.Unmarshal([]byte(message))
+// Extrahiert Spielername und gibt das komplette Login-Paket zurück
+func extractPlayerNameFromBytes(data []byte, protocol proto.Protocol) (string, []byte, error) {
+	if len(data) < 3 {
+		return "", nil, fmt.Errorf("insufficient data")
+	}
+	
+	reader := bytes.NewReader(data)
+	originalPos := reader.Len()
+	
+	// Lese Packet Length (VarInt)
+	packetLen, err := util.ReadVarInt(reader)
 	if err != nil {
-		return &component.Text{Content: message}
+		return "", nil, err
 	}
-	return comp
+	
+	if packetLen <= 0 || packetLen > len(data) {
+		return "", nil, fmt.Errorf("invalid packet length: %d", packetLen)
+	}
+	
+	// Berechne Start-Position des Pakets
+	startPos := originalPos - reader.Len()
+	
+	// Lese Packet ID
+	packetID, err := util.ReadVarInt(reader)
+	if err != nil {
+		return "", nil, err
+	}
+	
+	// Prüfe ob es Login Start ist (ID 0x00 im Login state)
+	if packetID != 0x00 {
+		return "", nil, fmt.Errorf("not a login start packet, got ID: 0x%02x", packetID)
+	}
+	
+	// Lese Username
+	username, err := util.ReadStringMax(reader, 16)
+	if err != nil {
+		return "", nil, err
+	}
+	
+	// Extrahiere das komplette Paket
+	packetEndPos := startPos + int(util.VarIntBytes(packetLen)) + int(packetLen)
+	if packetEndPos > len(data) {
+		return "", nil, fmt.Errorf("packet extends beyond data")
+	}
+	
+	loginPacket := data[startPos:packetEndPos]
+	
+	return username, loginPacket, nil
 }
 
-// Handler für PostLoginEvent
-func (p *joinNotifierPlugin) handlePostLogin(e *proxy.PostLoginEvent) {
-	player := e.Player()
-	if player == nil {
+// Modifizierte Forward-Funktion
+func ForwardWithPlayerName(
+	dialTimeout time.Duration,
+	routes []config.Route,
+	log logr.Logger,
+	client netmc.MinecraftConn,
+	handshake *packet.Handshake,
+	pc *proto.PacketContext,
+) {
+	defer func() { _ = client.Close() }()
+
+	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake)
+	if err != nil {
+		errs.V(log, err).Info("failed to find route", "error", err)
 		return
 	}
 
-	playerName := player.Username()
-	playerID := player.ID()
-	playerUUID := playerID.String()
-	
-	p.mu.Lock()
-	_, exists := p.playerCache[playerID]
-	p.playerCache[playerID] = playerInfo{
-		name:     playerName,
-		uuid:     playerID,
-		joinTime: time.Now(),
-	}
-	p.mu.Unlock()
-	
-	if !exists {
-		p.log.Info("Spieler hat den Server betreten", 
-			"player", playerName, 
-			"uuid", playerUUID,
-			"method", "PostLoginEvent")
-		
-		// Kurze UUID (erste 8 Zeichen)
-		shortUUID := playerUUID
-		if len(playerUUID) > 8 {
-			shortUUID = playerUUID[:8] + "..."
-		}
-		
-		message := fmt.Sprintf(p.joinMessage, playerName, shortUUID)
-		p.broadcastMessage(message)
-	}
-}
+	// Setze den Logger für das Blacklist-Paket
+	blacklist.SetLogger(log)
 
-// Handler für DisconnectEvent
-func (p *joinNotifierPlugin) handleDisconnect(e *proxy.DisconnectEvent) {
-	player := e.Player()
-	if player == nil {
+	// Extrahiere die Client-IP und prüfe auf Blacklist
+	clientIP, _, err := net.SplitHostPort(src.RemoteAddr().String())
+	if err == nil && blacklist.CheckIP(clientIP) {
+		log.Info("Connection rejected - IP is blacklisted", "ip", clientIP)
 		return
 	}
 
-	playerName := player.Username()
-	playerID := player.ID()
-	playerUUID := playerID.String()
-	
-	p.mu.Lock()
-	info, exists := p.playerCache[playerID]
-	delete(p.playerCache, playerID)
-	p.mu.Unlock()
-	
-	if exists {
-		p.log.Info("Spieler hat den Server verlassen", 
-			"player", playerName, 
-			"uuid", playerUUID,
-			"method", "DisconnectEvent",
-			"sessionDuration", time.Since(info.joinTime).Round(time.Second))
-		
-		// Kurze UUID (erste 8 Zeichen)
-		shortUUID := playerUUID
-		if len(playerUUID) > 8 {
-			shortUUID = playerUUID[:8] + "..."
-		}
-		
-		message := fmt.Sprintf(p.quitMessage, playerName, shortUUID)
-		p.broadcastMessage(message)
+	// Find a backend to dial successfully.
+	log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
+		conn, err := dialRoute(client.Context(), dialTimeout, src.RemoteAddr(), route, backendAddr, handshake, pc, false)
+		return log, conn, err
+	})
+	if err != nil {
+		return
 	}
-}
+	defer func() { _ = dst.Close() }()
 
-// Regelmäßiger Check zur Erkennung von Spieleränderungen (Fallback-System)
-func (p *joinNotifierPlugin) checkPlayersRegularly(ctx context.Context) {
-	ticker := time.NewTicker(p.checkInterval)
-	defer ticker.Stop()
+	// MODIFIZIERT: Verwende die neue Funktion mit Spielername-Extraktion
+	playerName, err := emptyReadBuffWithPlayerName(client, dst, log, proto.Protocol(handshake.ProtocolVersion), handshake)
+	if err != nil {
+		errs.V(log, err).Info("failed to process client buffer", "error", err)
+		return
+	}
 
-	p.log.Info("Fallback-Spielerüberwachung gestartet", "interval", p.checkInterval)
-	
-	for {
-		select {
-		case <-ctx.Done():
-			p.log.Info("Fallback-Spielerüberwachung beendet")
+	// Füge Spielername zum Logger hinzu falls verfügbar
+	if playerName != "" {
+		log = log.WithValues("playerName", playerName)
+		
+		// Prüfe Spielername-Blacklist
+		if isPlayerBlacklisted(playerName) {
+			log.Info("Connection rejected - player is blacklisted", "playerName", playerName)
 			return
-		case <-ticker.C:
-			p.checkPlayerChanges()
 		}
 	}
+
+	log.Info("forwarding connection", 
+		"backendAddr", netutil.Host(dst.RemoteAddr()),
+		"playerName", playerName)
+	
+	pipe(log, src, dst)
 }
 
-// Prüft auf Spieleränderungen (für den Fall, dass Events nicht funktionieren)
-func (p *joinNotifierPlugin) checkPlayerChanges() {
-	currentPlayers := make(map[uuid.UUID]playerInfo)
-	
-	// Aktuelle Spielerliste erfassen
-	for _, player := range p.proxy.Players() {
-		currentPlayers[player.ID()] = playerInfo{
-			name:     player.Username(),
-			uuid:     player.ID(),
-			joinTime: time.Now(),
-		}
+// Einfache Spielername-Blacklist
+func isPlayerBlacklisted(playerName string) bool {
+	blacklistedPlayers := []string{
+		"griefer123", 
+		"hacker456", 
+		"spammer789",
+		// Füge hier weitere Namen hinzu
 	}
 	
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	// Prüfen, ob neue Spieler hinzugekommen sind
-	for id, info := range currentPlayers {
-		if _, exists := p.playerCache[id]; !exists {
-			// Neuer Spieler gefunden (Fallback)
-			p.log.Info("Spieler hat den Server betreten", 
-				"player", info.name, 
-				"uuid", info.uuid.String(),
-				"method", "Fallback-Polling")
-			
-			playerUUID := info.uuid.String()
-			shortUUID := playerUUID
-			if len(playerUUID) > 8 {
-				shortUUID = playerUUID[:8] + "..."
-			}
-			
-			message := fmt.Sprintf(p.joinMessage, info.name, shortUUID)
-			p.broadcastMessageUnsafe(message) // Wir haben bereits den Lock
-			
-			p.playerCache[id] = info
+	for _, blocked := range blacklistedPlayers {
+		if playerName == blocked {
+			return true
 		}
 	}
-	
-	// Prüfen, ob Spieler den Server verlassen haben
-	for id, info := range p.playerCache {
-		if _, exists := currentPlayers[id]; !exists {
-			// Spieler hat den Server verlassen (Fallback)
-			p.log.Info("Spieler hat den Server verlassen", 
-				"player", info.name, 
-				"uuid", info.uuid.String(),
-				"method", "Fallback-Polling",
-				"sessionDuration", time.Since(info.joinTime).Round(time.Second))
-			
-			playerUUID := info.uuid.String()
-			shortUUID := playerUUID
-			if len(playerUUID) > 8 {
-				shortUUID = playerUUID[:8] + "..."
-			}
-			
-			message := fmt.Sprintf(p.quitMessage, info.name, shortUUID)
-			p.broadcastMessageUnsafe(message) // Wir haben bereits den Lock
-			
-			delete(p.playerCache, id)
-		}
-	}
+	return false
 }
 
-// Hilfsfunktion zum Senden einer Nachricht an alle Spieler (mit Lock)
-func (p *joinNotifierPlugin) broadcastMessage(message string) {
-	comp := textComponent(message)
-	
-	for _, player := range p.proxy.Players() {
-		if err := player.SendMessage(comp); err != nil {
-			p.log.Error(err, "Fehler beim Senden der Nachricht", 
-				"player", player.Username())
-		}
+// Hilfsfunktion um VarInt Byte-Länge zu berechnen
+func varIntBytes(value int) int {
+	if value == 0 {
+		return 1
 	}
+	bytes := 0
+	for value != 0 {
+		value >>>= 7
+		bytes++
+	}
+	return bytes
 }
 
-// Hilfsfunktion zum Senden einer Nachricht an alle Spieler (ohne Lock - bereits gelockt)
-func (p *joinNotifierPlugin) broadcastMessageUnsafe(message string) {
-	comp := textComponent(message)
-	
-	for _, player := range p.proxy.Players() {
-		if err := player.SendMessage(comp); err != nil {
-			p.log.Error(err, "Fehler beim Senden der Nachricht", 
-				"player", player.Username())
-		}
+// ALTERNATIVE: Einfacher Player-Logger (falls Extraktion fehlschlägt)
+// Loggt nur das Factum dass ein Login-Versuch stattfindet
+func logPlayerAttempt(log logr.Logger, handshake *packet.Handshake, clientAddr net.Addr) {
+	if handshake.NextState == 2 { // Login state
+		log.Info("Player login attempt detected", 
+			"clientAddr", netutil.Host(clientAddr),
+			"protocol", proto.Protocol(handshake.ProtocolVersion).String(),
+			"virtualHost", handshake.ServerAddress)
 	}
 }
