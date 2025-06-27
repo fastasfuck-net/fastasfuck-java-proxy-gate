@@ -55,6 +55,28 @@ func Forward(
 		return
 	}
 
+	// KORRIGIERT: Login-Detection VOR emptyReadBuff
+	if handshake.NextState == 2 {
+		log.Info("Player login detected", 
+			"clientAddr", netutil.Host(src.RemoteAddr()),
+			"protocol", proto.Protocol(handshake.ProtocolVersion).String())
+		
+		// Optional: Prüfe Buffer-Größe BEVOR er geleert wird
+		if buf, ok := client.(interface{ ReadBuffered() ([]byte, error) }); ok {
+			if data, err := buf.ReadBuffered(); err == nil {
+				log.Info("Login buffer info", "bufferSize", len(data))
+				// KORRIGIERT: Verwende math.Min oder eine einfache if-Bedingung
+				previewLen := len(data)
+				if previewLen > 20 {
+					previewLen = 20
+				}
+				if len(data) > 0 {
+					log.V(1).Info("Buffer preview", "firstBytes", fmt.Sprintf("%x", data[:previewLen]))
+				}
+			}
+		}
+	} // KORRIGIERT: Fehlende schließende Klammer
+
 	// Find a backend to dial successfully.
 	log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
 		conn, err := dialRoute(client.Context(), dialTimeout, src.RemoteAddr(), route, backendAddr, handshake, pc, false)
@@ -70,23 +92,7 @@ func Forward(
 		return
 	}
 
-	if handshake.NextState == 2 {
-        log.Info("Player login detected", 
-            "clientAddr", netutil.Host(src.RemoteAddr()),
-            "protocol", proto.Protocol(handshake.ProtocolVersion).String())
-        
-        // Optional: Warte kurz und logge Buffer-Größe
-        time.Sleep(10 * time.Millisecond)
-        if buf, ok := client.(interface{ ReadBuffered() ([]byte, error) }); ok {
-            if data, err := buf.ReadBuffered(); err == nil {
-                log.Info("Login buffer info", "bufferSize", len(data))
-                // Hier könntest du den ersten Teil des Buffers loggen
-                if len(data) > 0 {
-                    log.V(1).Info("Buffer preview", "firstBytes", fmt.Sprintf("%x", data[:min(20, len(data))]))
-                }
-            }
-        }
-
+	// KORRIGIERT: Dieser Log-Call ist wieder außerhalb des Login-Blocks
 	log.Info("forwarding connection", "backendAddr", netutil.Host(dst.RemoteAddr()))
 	pipe(log, src, dst)
 }
