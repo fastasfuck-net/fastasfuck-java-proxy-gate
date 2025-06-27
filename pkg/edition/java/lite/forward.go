@@ -27,7 +27,8 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// Forward function with player name logging
+// relevant part of Forward function from pkg/edition/java/lite/forward.go
+
 func Forward(
 	dialTimeout time.Duration,
 	routes []config.Route,
@@ -50,13 +51,12 @@ func Forward(
 	// Extrahiere die Client-IP und prüfe auf Blacklist
 	clientIP, _, err := net.SplitHostPort(src.RemoteAddr().String())
 	if err == nil && blacklist.CheckIP(clientIP) {
-		log.Info("Connection rejected - IP is blacklisted", "ip", clientIP)
+		log.Info("Connection rejected - IP is blacklisted")
 		return
 	}
 
-	// Verbindungs-Detection
+	// NEU: Einfache Verbindungs-Detection (ohne IP-Logging)
 	log.Info("Connection attempt detected", 
-		"clientAddr", netutil.Host(src.RemoteAddr()),
 		"protocol", proto.Protocol(handshake.ProtocolVersion).String(),
 		"serverAddress", handshake.ServerAddress)
 
@@ -76,78 +76,7 @@ func Forward(
 	}
 
 	log.Info("forwarding connection", "backendAddr", netutil.Host(dst.RemoteAddr()))
-
-	// NEU: Spielername aus Login Start Packet extrahieren und loggen
-	if handshake.NextStatus == int(state.Login) {
-		playerName, loginPacket, err := capturePlayerName(client, log)
-		if err != nil {
-			log.Info("failed to capture player name", "error", err)
-		} else if playerName != "" {
-			log.Info("Player login detected", 
-				"playerName", playerName,
-				"clientAddr", netutil.Host(src.RemoteAddr()),
-				"serverAddress", handshake.ServerAddress)
-			
-			// Leite das Login Start Packet an den Backend weiter
-			if loginPacket != nil {
-				if err := writeRawPacket(dst, loginPacket); err != nil {
-					log.Info("failed to forward login packet", "error", err)
-					return
-				}
-			}
-		}
-	}
-
 	pipe(log, src, dst)
-}
-
-// capturePlayerName liest das Login Start Packet und extrahiert den Spielernamen
-func capturePlayerName(client netmc.MinecraftConn, log logr.Logger) (string, []byte, error) {
-	// Erstelle einen Decoder für den Client
-	decoder := codec.NewDecoder(client, proto.ServerBound, log.V(2))
-	decoder.SetProtocol(proto.Protocol1_19_4) // Setze ein Standard-Protokoll
-	decoder.SetState(state.Login)
-
-	// Lese das nächste Packet (sollte Login Start sein)
-	packetCtx, err := decoder.Decode()
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to decode login packet: %w", err)
-	}
-
-	// Prüfe ob es ein Login Start Packet ist
-	if loginStart, ok := packetCtx.Packet.(*packet.LoginStart); ok {
-		// Erstelle das rohe Packet für die Weiterleitung
-		rawPacket, err := encodePacket(packetCtx)
-		if err != nil {
-			return loginStart.Username, nil, fmt.Errorf("failed to encode login packet: %w", err)
-		}
-		return loginStart.Username, rawPacket, nil
-	}
-
-	return "", nil, fmt.Errorf("expected LoginStart packet, got %T", packetCtx.Packet)
-}
-
-// encodePacket kodiert ein PacketContext zurück in rohe Bytes
-func encodePacket(pc *proto.PacketContext) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	
-	// Schreibe Packet-Länge
-	if err := util.WriteVarInt(buf, len(pc.Payload)); err != nil {
-		return nil, err
-	}
-	
-	// Schreibe Payload
-	if _, err := buf.Write(pc.Payload); err != nil {
-		return nil, err
-	}
-	
-	return buf.Bytes(), nil
-}
-
-// writeRawPacket schreibt rohe Packet-Bytes an eine Verbindung
-func writeRawPacket(conn net.Conn, data []byte) error {
-	_, err := conn.Write(data)
-	return err
 }
 
 // errAllBackendsFailed is returned when all backends failed to dial.
@@ -228,7 +157,6 @@ func findRoute(
 
 	clearedHost := ClearVirtualHost(handshake.ServerAddress)
 	log = log.WithName("lite").WithValues(
-		"clientAddr", netutil.Host(src.RemoteAddr()),
 		"virtualHost", clearedHost,
 		"protocol", proto.Protocol(handshake.ProtocolVersion).String(),
 	)
