@@ -13,11 +13,8 @@ var Plugin = proxy.Plugin{
 		log := logr.FromContextOrDiscard(ctx)
 		log.Info("JoinNotifier Plugin loaded (placeholder)")
 		
-		// Hier könntest du später echte Join-Notification-Logik hinzufügen
-		// Zum Beispiel:
-		event.Subscribe(p.Event(), 0, func(e *proxy.PostLoginEvent) {
-	     log.Info("Player joined", "player", e.Player().Username())
-		})
+		// TODO: Hier könntest du später echte Join-Notification-Logik hinzufügen
+		// z.B. Event-Subscriptions für Player-Joins
 		
 		return nil
 	},
