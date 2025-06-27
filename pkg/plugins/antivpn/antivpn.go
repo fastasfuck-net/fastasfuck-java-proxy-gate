@@ -56,7 +56,6 @@ var Plugin = proxy.Plugin{
 			ispRegexList:    make([]*regexp.Regexp, 0),
 			blockedIPs:      make(map[string]bool),
 			whoisCache:      make(map[string]*whoisResult),
-			activeConnections: make(map[string]net.Conn),
 			
 			// Statistiken initialisieren
 			stats: &connectionStats{
@@ -135,10 +134,6 @@ type vpnProxyPlugin struct {
 	stats          *connectionStats
 	statsMutex     sync.RWMutex
 	statsStartTime time.Time
-	
-	// Aktive Verbindungen für Disconnect-Nachrichten
-	activeConnections map[string]net.Conn
-	connMutex        sync.RWMutex
 }
 
 type whoisResult struct {
@@ -512,6 +507,12 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 	}
 
 	if ipAddr == "" {
+		return
+	}
+
+	// Lokale und private IPs nicht blockieren
+	ip := net.ParseIP(ipAddr)
+	if ip != nil && (ip.IsLoopback() || ip.IsPrivate()) {
 		return
 	}
 
@@ -997,39 +998,6 @@ func extractIP(addr net.Addr) string {
 		return ipStr
 	}
 	return ""
-}
-
-func isPrivateIP(ip net.IP) bool {
-	privateIPv4Blocks := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"127.0.0.0/8",
-	}
-
-	privateIPv6Blocks := []string{
-		"fc00::/7",
-		"fe80::/10",
-		"::1/128",
-	}
-
-	if ip.To4() != nil {
-		for _, block := range privateIPv4Blocks {
-			_, cidr, err := net.ParseCIDR(block)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-	} else {
-		for _, block := range privateIPv6Blocks {
-			_, cidr, err := net.ParseCIDR(block)
-			if err == nil && cidr.Contains(ip) {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 func tryGetRemoteAddr(e interface{}) string {
