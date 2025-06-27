@@ -23,14 +23,14 @@ var Plugin = proxy.Plugin{
 
 		// Erstelle eine neue Instanz des Plugins
 		plugin := &joinNotifierPlugin{
-			log:         log,
-			proxy:       p,
-			playerCache: make(map[uuid.UUID]time.Time),
+			log:           log,
+			proxy:         p,
+			playerCache:   make(map[uuid.UUID]playerInfo),
 			// HIER EINSTELLUNGEN ANPASSEN:
-			enabled:     true,
-			joinMessage: "&8[&aGatelite&8] &eDer Spieler &b%s &ehat den Server betreten!",
-			quitMessage: "&8[&aGatelite&8] &eDer Spieler &b%s &ehat den Server verlassen!",
-			checkInterval: 2 * time.Second,
+			enabled:       true,
+			joinMessage:   "&8[&aGatelite&8] &eDer Spieler &b%s &8(&7%s&8) &ehat den Server betreten!",
+			quitMessage:   "&8[&aGatelite&8] &eDer Spieler &b%s &8(&7%s&8) &ehat den Server verlassen!",
+			checkInterval: 3 * time.Second,
 		}
 
 		if !plugin.enabled {
@@ -38,11 +38,11 @@ var Plugin = proxy.Plugin{
 			return nil
 		}
 
-		// Da wir keine direkten Join/Leave-Events haben, versuchen wir alle verfügbaren Events
-		_ = event.Subscribe(p.Event(), 0, plugin.handlePostLogin)
-		_ = event.Subscribe(p.Event(), 0, plugin.handleDisconnect)
+		// Registriere spezifische Event-Handler
+		event.Subscribe(p.Event(), 0, plugin.handlePostLogin)
+		event.Subscribe(p.Event(), 0, plugin.handleDisconnect)
 		
-		// Starte einen Hintergrundprozess zur Erkennung von Spieleränderungen
+		// Starte einen Hintergrundprozess zur Erkennung von Spieleränderungen (Fallback)
 		go plugin.checkPlayersRegularly(ctx)
 
 		log.Info("Join Notifier Plugin erfolgreich initialisiert!")
@@ -51,16 +51,22 @@ var Plugin = proxy.Plugin{
 	},
 }
 
+type playerInfo struct {
+	name     string
+	uuid     uuid.UUID
+	joinTime time.Time
+}
+
 type joinNotifierPlugin struct {
 	log           logr.Logger
 	proxy         *proxy.Proxy
 	enabled       bool
-	joinMessage   string
-	quitMessage   string
+	joinMessage   string // Format: playerName, playerUUID
+	quitMessage   string // Format: playerName, playerUUID
 	checkInterval time.Duration
 	
-	mu           sync.Mutex
-	playerCache  map[uuid.UUID]time.Time // Spieler-Cache, um Änderungen zu erkennen
+	mu           sync.RWMutex
+	playerCache  map[uuid.UUID]playerInfo
 }
 
 // Wandelt einen String in eine component.Component um
@@ -73,7 +79,7 @@ func textComponent(message string) component.Component {
 	return comp
 }
 
-// Handler für PostLoginEvent (falls verfügbar)
+// Handler für PostLoginEvent
 func (p *joinNotifierPlugin) handlePostLogin(e *proxy.PostLoginEvent) {
 	player := e.Player()
 	if player == nil {
@@ -82,20 +88,35 @@ func (p *joinNotifierPlugin) handlePostLogin(e *proxy.PostLoginEvent) {
 
 	playerName := player.Username()
 	playerID := player.ID()
+	playerUUID := playerID.String()
 	
 	p.mu.Lock()
 	_, exists := p.playerCache[playerID]
-	p.playerCache[playerID] = time.Now()
+	p.playerCache[playerID] = playerInfo{
+		name:     playerName,
+		uuid:     playerID,
+		joinTime: time.Now(),
+	}
 	p.mu.Unlock()
 	
 	if !exists {
-		p.log.Info("Spieler hat den Server betreten (Event)", "player", playerName)
-		message := fmt.Sprintf(p.joinMessage, playerName)
+		p.log.Info("Spieler hat den Server betreten", 
+			"player", playerName, 
+			"uuid", playerUUID,
+			"method", "PostLoginEvent")
+		
+		// Kurze UUID (erste 8 Zeichen)
+		shortUUID := playerUUID
+		if len(playerUUID) > 8 {
+			shortUUID = playerUUID[:8] + "..."
+		}
+		
+		message := fmt.Sprintf(p.joinMessage, playerName, shortUUID)
 		p.broadcastMessage(message)
 	}
 }
 
-// Handler für DisconnectEvent (falls verfügbar)
+// Handler für DisconnectEvent
 func (p *joinNotifierPlugin) handleDisconnect(e *proxy.DisconnectEvent) {
 	player := e.Player()
 	if player == nil {
@@ -104,68 +125,131 @@ func (p *joinNotifierPlugin) handleDisconnect(e *proxy.DisconnectEvent) {
 
 	playerName := player.Username()
 	playerID := player.ID()
+	playerUUID := playerID.String()
 	
 	p.mu.Lock()
+	info, exists := p.playerCache[playerID]
 	delete(p.playerCache, playerID)
 	p.mu.Unlock()
 	
-	p.log.Info("Spieler hat den Server verlassen (Event)", "player", playerName)
-	message := fmt.Sprintf(p.quitMessage, playerName)
-	p.broadcastMessage(message)
+	if exists {
+		p.log.Info("Spieler hat den Server verlassen", 
+			"player", playerName, 
+			"uuid", playerUUID,
+			"method", "DisconnectEvent",
+			"sessionDuration", time.Since(info.joinTime).Round(time.Second))
+		
+		// Kurze UUID (erste 8 Zeichen)
+		shortUUID := playerUUID
+		if len(playerUUID) > 8 {
+			shortUUID = playerUUID[:8] + "..."
+		}
+		
+		message := fmt.Sprintf(p.quitMessage, playerName, shortUUID)
+		p.broadcastMessage(message)
+	}
 }
 
-// Regelmäßiger Check zur Erkennung von Spieleränderungen
+// Regelmäßiger Check zur Erkennung von Spieleränderungen (Fallback-System)
 func (p *joinNotifierPlugin) checkPlayersRegularly(ctx context.Context) {
 	ticker := time.NewTicker(p.checkInterval)
 	defer ticker.Stop()
 
-	var lastPlayers = make(map[uuid.UUID]string)
+	p.log.Info("Fallback-Spielerüberwachung gestartet", "interval", p.checkInterval)
 	
 	for {
 		select {
 		case <-ctx.Done():
+			p.log.Info("Fallback-Spielerüberwachung beendet")
 			return
 		case <-ticker.C:
-			currentPlayers := make(map[uuid.UUID]string)
-			
-			// Aktuelle Spielerliste erfassen
-			for _, player := range p.proxy.Players() {
-				currentPlayers[player.ID()] = player.Username()
-			}
-			
-			// Prüfen, ob neue Spieler hinzugekommen sind
-			for id, name := range currentPlayers {
-				if _, exists := lastPlayers[id]; !exists {
-					// Neuer Spieler gefunden
-					p.log.Info("Spieler hat den Server betreten (Polling)", "player", name)
-					message := fmt.Sprintf(p.joinMessage, name)
-					p.broadcastMessage(message)
-				}
-			}
-			
-			// Prüfen, ob Spieler den Server verlassen haben
-			for id, name := range lastPlayers {
-				if _, exists := currentPlayers[id]; !exists {
-					// Spieler hat den Server verlassen
-					p.log.Info("Spieler hat den Server verlassen (Polling)", "player", name)
-					message := fmt.Sprintf(p.quitMessage, name)
-					p.broadcastMessage(message)
-				}
-			}
-			
-			// Spielerliste aktualisieren
-			lastPlayers = currentPlayers
+			p.checkPlayerChanges()
 		}
 	}
 }
 
-// Hilfsfunktion zum Senden einer Nachricht an alle Spieler
+// Prüft auf Spieleränderungen (für den Fall, dass Events nicht funktionieren)
+func (p *joinNotifierPlugin) checkPlayerChanges() {
+	currentPlayers := make(map[uuid.UUID]playerInfo)
+	
+	// Aktuelle Spielerliste erfassen
+	for _, player := range p.proxy.Players() {
+		currentPlayers[player.ID()] = playerInfo{
+			name:     player.Username(),
+			uuid:     player.ID(),
+			joinTime: time.Now(),
+		}
+	}
+	
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	// Prüfen, ob neue Spieler hinzugekommen sind
+	for id, info := range currentPlayers {
+		if _, exists := p.playerCache[id]; !exists {
+			// Neuer Spieler gefunden (Fallback)
+			p.log.Info("Spieler hat den Server betreten", 
+				"player", info.name, 
+				"uuid", info.uuid.String(),
+				"method", "Fallback-Polling")
+			
+			playerUUID := info.uuid.String()
+			shortUUID := playerUUID
+			if len(playerUUID) > 8 {
+				shortUUID = playerUUID[:8] + "..."
+			}
+			
+			message := fmt.Sprintf(p.joinMessage, info.name, shortUUID)
+			p.broadcastMessageUnsafe(message) // Wir haben bereits den Lock
+			
+			p.playerCache[id] = info
+		}
+	}
+	
+	// Prüfen, ob Spieler den Server verlassen haben
+	for id, info := range p.playerCache {
+		if _, exists := currentPlayers[id]; !exists {
+			// Spieler hat den Server verlassen (Fallback)
+			p.log.Info("Spieler hat den Server verlassen", 
+				"player", info.name, 
+				"uuid", info.uuid.String(),
+				"method", "Fallback-Polling",
+				"sessionDuration", time.Since(info.joinTime).Round(time.Second))
+			
+			playerUUID := info.uuid.String()
+			shortUUID := playerUUID
+			if len(playerUUID) > 8 {
+				shortUUID = playerUUID[:8] + "..."
+			}
+			
+			message := fmt.Sprintf(p.quitMessage, info.name, shortUUID)
+			p.broadcastMessageUnsafe(message) // Wir haben bereits den Lock
+			
+			delete(p.playerCache, id)
+		}
+	}
+}
+
+// Hilfsfunktion zum Senden einer Nachricht an alle Spieler (mit Lock)
 func (p *joinNotifierPlugin) broadcastMessage(message string) {
 	comp := textComponent(message)
 	
 	for _, player := range p.proxy.Players() {
 		if err := player.SendMessage(comp); err != nil {
-			p.log.Error(err, "Fehler beim Senden der Nachricht", "player", player.Username())
+			p.log.Error(err, "Fehler beim Senden der Nachricht", 
+				"player", player.Username())
+		}
+	}
+}
+
+// Hilfsfunktion zum Senden einer Nachricht an alle Spieler (ohne Lock - bereits gelockt)
+func (p *joinNotifierPlugin) broadcastMessageUnsafe(message string) {
+	comp := textComponent(message)
+	
+	for _, player := range p.proxy.Players() {
+		if err := player.SendMessage(comp); err != nil {
+			p.log.Error(err, "Fehler beim Senden der Nachricht", 
+				"player", player.Username())
 		}
 	}
 }
