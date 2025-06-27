@@ -53,25 +53,11 @@ func Forward(
 		return
 	}
 
-	// KORRIGIERT: Versuche verschiedene Möglichkeiten für Login-Detection
-	isLoginAttempt := false
-	
-	// Option 1: Prüfe HandshakeIntent (wahrscheinlichste Lösung)
-	if handshake.Intent == packet.LoginIntent {
-		isLoginAttempt = true
-	}
-	
-	// Option 2: Falls Intent nicht existiert, prüfe andere Felder
-	// Entkommentiere eine der folgenden Zeilen falls Option 1 nicht funktioniert:
-	// if handshake.NextState == 2 { isLoginAttempt = true }
-	// if handshake.State == 2 { isLoginAttempt = true }
-	// if handshake.Type == 2 { isLoginAttempt = true }
-
-	if isLoginAttempt {
-		log.Info("Player login detected", 
-			"clientAddr", netutil.Host(src.RemoteAddr()),
-			"protocol", proto.Protocol(handshake.ProtocolVersion).String())
-	}
+	// EINFACHE LÖSUNG: Logge alle Verbindungen mit Debug-Info
+	log.Info("Connection attempt detected", 
+		"clientAddr", netutil.Host(src.RemoteAddr()),
+		"protocol", proto.Protocol(handshake.ProtocolVersion).String(),
+		"serverAddress", handshake.ServerAddress)
 
 	// Find a backend to dial successfully.
 	log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
@@ -92,7 +78,6 @@ func Forward(
 	pipe(log, src, dst)
 }
 
-// Rest der Funktionen bleibt unverändert...
 // errAllBackendsFailed is returned when all backends failed to dial.
 var errAllBackendsFailed = errors.New("all backends failed")
 
