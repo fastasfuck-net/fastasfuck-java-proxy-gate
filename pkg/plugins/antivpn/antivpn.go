@@ -1,0 +1,669 @@
+package antivpn
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/robinbraemer/event"
+	c "go.minekube.com/common/minecraft/component"
+	"go.minekube.com/gate/pkg/edition/java/proxy"
+	"go.minekube.com/gate/pkg/edition/java/lite/blacklist"
+)
+
+// Plugin ist ein VPN/Proxy-Erkennungs-Plugin
+var Plugin = proxy.Plugin{
+	Name: "VPNProxyDetector",
+	Init: func(ctx context.Context, p *proxy.Proxy) error {
+		log := logr.FromContextOrDiscard(ctx)
+		log.Info("VPN/Proxy Detection Plugin wird initialisiert...")
+
+		// Erstelle eine neue Instanz des Plugins
+		plugin := &vpnProxyPlugin{
+			log: log,
+			
+			// HIER EINSTELLUNGEN ANPASSEN:
+			asnListURLs: []string{
+				"https://raw.githubusercontent.com/sysvar/lists_vpn/refs/heads/main/input/datacenter/ASN.txt",
+				"https://raw.githubusercontent.com/fastasfuck-net/VPN-List/refs/heads/main/ASN.txt",
+			},
+			ispListURLs: []string{
+				"https://raw.githubusercontent.com/fastasfuck-net/VPN-List/refs/heads/main/ISP.txt",
+			},
+			ipListURL: "https://raw.githubusercontent.com/fastasfuck-net/VPN-List/refs/heads/main/IP.txt",
+			
+			updateInterval: 5 * time.Minute, // Update-Intervall für Listen
+			blockMessage:   "VPN/Proxy connections are not allowed on this server\nPlease disconnect from your VPN/Proxy and try again",
+			enabled:        true,
+			
+			// Interne Maps
+			asnRegexList:    make([]*regexp.Regexp, 0),
+			ispRegexList:    make([]*regexp.Regexp, 0),
+			blockedIPs:      make(map[string]bool),
+			whoisCache:      make(map[string]*whoisResult),
+		}
+
+		if !plugin.enabled {
+			log.Info("VPN/Proxy Detection Plugin ist deaktiviert.")
+			return nil
+		}
+
+		// Initialisiere lokale Blacklist-Dateien
+		err := blacklist.InitBlacklist("./ip_blacklist.json", "./route_blacklist.json")
+		if err != nil {
+			log.Error(err, "Fehler beim Initialisieren der lokalen Blacklists")
+		}
+
+		// Starte den Update-Prozess im Hintergrund
+		go plugin.startListUpdater(ctx)
+
+		// Event-Handler registrieren
+		event.Subscribe(p.Event(), 0, func(e event.Event) {
+			plugin.handleEvent(e)
+		})
+
+		// Registriere die IP-Check-Funktion für Gate Lite
+		blacklist.RegisterIPCheckFunc(plugin.isBlocked)
+
+		log.Info("VPN/Proxy Detection Plugin erfolgreich initialisiert!",
+			"asnListURLs", len(plugin.asnListURLs),
+			"ispListURLs", len(plugin.ispListURLs),
+			"updateInterval", plugin.updateInterval)
+		return nil
+	},
+}
+
+type vpnProxyPlugin struct {
+	log            logr.Logger
+	
+	// Konfiguration
+	asnListURLs    []string
+	ispListURLs    []string
+	ipListURL      string
+	updateInterval time.Duration
+	blockMessage   string
+	enabled        bool
+	
+	// Listen und Caches
+	asnRegexList   []*regexp.Regexp
+	ispRegexList   []*regexp.Regexp
+	blockedIPs     map[string]bool
+	whoisCache     map[string]*whoisResult
+	listMutex      sync.RWMutex
+	cacheMutex     sync.RWMutex
+}
+
+type whoisResult struct {
+	ISP       string
+	ASN       int
+	ASNOrg    string
+	CacheTime time.Time
+}
+
+// isBlocked prüft, ob eine IP als VPN/Proxy erkannt wird
+func (p *vpnProxyPlugin) isBlocked(ipAddr string) bool {
+	if ipAddr == "" {
+		return false
+	}
+
+	ip := net.ParseIP(ipAddr)
+	if ip == nil {
+		p.log.V(1).Info("Ungültige IP-Adresse", "ip", ipAddr)
+		return false
+	}
+
+	// Lokale und private IPs nicht blockieren
+	if ip.IsLoopback() || isPrivateIP(ip) {
+		return false
+	}
+
+	// Prüfe verschiedene Erkennungsmethoden
+	result := p.analyzeIP(ipAddr)
+	
+	if result.IsVPN {
+		p.log.Info("VPN/Proxy erkannt", 
+			"ip", ipAddr,
+			"asnMatch", result.ASNMatch,
+			"ispMatch", result.ISPMatch,
+			"ipListed", result.IPListed,
+			"asn", result.ASN,
+			"isp", result.ISP)
+		return true
+	}
+
+	return false
+}
+
+// analyzeIP führt eine umfassende Analyse einer IP-Adresse durch
+func (p *vpnProxyPlugin) analyzeIP(ipAddr string) *analysisResult {
+	result := &analysisResult{
+		IP: ipAddr,
+	}
+
+	// 1. Prüfe gegen IP-Liste
+	p.listMutex.RLock()
+	result.IPListed = p.blockedIPs[ipAddr]
+	p.listMutex.RUnlock()
+
+	// 2. Hole WHOIS-Daten (mit Cache)
+	whoisData := p.getWhoisData(ipAddr)
+	if whoisData != nil {
+		result.ISP = whoisData.ISP
+		result.ASN = whoisData.ASN
+		result.ASNOrg = whoisData.ASNOrg
+
+		// 3. Prüfe ASN gegen Liste
+		if whoisData.ASN > 0 {
+			asnStr := fmt.Sprintf("AS%d", whoisData.ASN)
+			p.listMutex.RLock()
+			for _, regex := range p.asnRegexList {
+				if regex.MatchString(asnStr) {
+					result.ASNMatch = true
+					break
+				}
+			}
+			p.listMutex.RUnlock()
+		}
+
+		// 4. Prüfe ISP gegen Liste
+		if whoisData.ISP != "" {
+			p.listMutex.RLock()
+			for _, regex := range p.ispRegexList {
+				if regex.MatchString(whoisData.ISP) {
+					result.ISPMatch = true
+					break
+				}
+			}
+			p.listMutex.RUnlock()
+		}
+
+		// 5. Prüfe ASN-Organisation gegen ISP-Liste
+		if !result.ISPMatch && whoisData.ASNOrg != "" {
+			p.listMutex.RLock()
+			for _, regex := range p.ispRegexList {
+				if regex.MatchString(whoisData.ASNOrg) {
+					result.ISPMatch = true
+					break
+				}
+			}
+			p.listMutex.RUnlock()
+		}
+	}
+
+	// Endergebnis: VPN/Proxy wenn eine der Methoden positiv ist
+	result.IsVPN = result.IPListed || result.ASNMatch || result.ISPMatch
+
+	return result
+}
+
+type analysisResult struct {
+	IP       string
+	IsVPN    bool
+	IPListed bool
+	ASNMatch bool
+	ISPMatch bool
+	ASN      int
+	ASNOrg   string
+	ISP      string
+}
+
+// getWhoisData holt WHOIS-Daten mit Caching
+func (p *vpnProxyPlugin) getWhoisData(ipAddr string) *whoisResult {
+	// Cache prüfen
+	p.cacheMutex.RLock()
+	if cached, exists := p.whoisCache[ipAddr]; exists {
+		// Cache-Eintrag ist 1 Stunde gültig
+		if time.Since(cached.CacheTime) < time.Hour {
+			p.cacheMutex.RUnlock()
+			return cached
+		}
+	}
+	p.cacheMutex.RUnlock()
+
+	// Neue WHOIS-Abfrage
+	result := p.performWhoisLookup(ipAddr)
+	if result != nil {
+		result.CacheTime = time.Now()
+		
+		// Cache aktualisieren
+		p.cacheMutex.Lock()
+		p.whoisCache[ipAddr] = result
+		p.cacheMutex.Unlock()
+	}
+
+	return result
+}
+
+// performWhoisLookup führt eine WHOIS-Abfrage durch
+func (p *vpnProxyPlugin) performWhoisLookup(ipAddr string) *whoisResult {
+	// Vereinfachte WHOIS-Implementierung
+	// In einer echten Implementierung würden Sie eine WHOIS-Bibliothek verwenden
+	
+	// Für dieses Beispiel verwenden wir eine einfache HTTP-Abfrage an einen WHOIS-Service
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Beispiel-URL für WHOIS-Daten (ersetzen Sie durch einen echten Service)
+	url := fmt.Sprintf("https://ipapi.co/%s/json/", ipAddr)
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		p.log.V(1).Info("Fehler beim Erstellen der WHOIS-Anfrage", "ip", ipAddr, "error", err)
+		return nil
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		p.log.V(1).Info("Fehler bei der WHOIS-Abfrage", "ip", ipAddr, "error", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)) // Max 1MB
+	if err != nil {
+		return nil
+	}
+
+	// Parse JSON-Response
+	var apiResult struct {
+		ASN     string `json:"asn"`
+		Org     string `json:"org"`
+		ISP     string `json:"isp"`
+		Company string `json:"company"`
+	}
+
+	if err := json.Unmarshal(body, &apiResult); err != nil {
+		return nil
+	}
+
+	result := &whoisResult{
+		ISP:    apiResult.ISP,
+		ASNOrg: apiResult.Org,
+	}
+
+	// Parse ASN
+	if apiResult.ASN != "" {
+		asnStr := strings.TrimPrefix(apiResult.ASN, "AS")
+		if asn, err := strconv.Atoi(asnStr); err == nil {
+			result.ASN = asn
+		}
+	}
+
+	// Fallback für ISP
+	if result.ISP == "" {
+		result.ISP = apiResult.Company
+	}
+
+	return result
+}
+
+// handleEvent verarbeitet Events
+func (p *vpnProxyPlugin) handleEvent(e event.Event) {
+	var ipAddr string
+	var virtualHost string
+	var disconnect func(c.Component)
+
+	// IP-Adresse aus Event extrahieren
+	switch eventType := e.(type) {
+	case *proxy.LoginEvent:
+		if player := eventType.Player(); player != nil {
+			ipAddr = extractIP(player.RemoteAddr())
+			virtualHost = player.VirtualHost().String()
+			disconnect = player.Disconnect
+		}
+	default:
+		ipAddr = tryGetRemoteAddr(e)
+		virtualHost = tryGetVirtualHost(e)
+	}
+
+	if ipAddr == "" {
+		return
+	}
+
+	p.log.V(1).Info("Verbindung analysiert",
+		"ip", ipAddr,
+		"virtualHost", virtualHost,
+		"eventType", fmt.Sprintf("%T", e))
+
+	// VPN/Proxy-Prüfung
+	if p.isBlocked(ipAddr) {
+		p.log.Info("VPN/Proxy-Verbindung blockiert",
+			"ip", ipAddr,
+			"virtualHost", virtualHost)
+
+		if disconnect != nil {
+			disconnect(&c.Text{Content: p.blockMessage})
+		} else {
+			tryDisconnect(e, &c.Text{Content: p.blockMessage})
+		}
+	}
+}
+
+// startListUpdater startet die regelmäßige Aktualisierung der Listen
+func (p *vpnProxyPlugin) startListUpdater(ctx context.Context) {
+	// Sofort beim Start aktualisieren
+	if err := p.updateAllLists(); err != nil {
+		p.log.Error(err, "Initialer Listen-Update fehlgeschlagen")
+	}
+
+	ticker := time.NewTicker(p.updateInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := p.updateAllLists(); err != nil {
+				p.log.Error(err, "Listen-Update fehlgeschlagen")
+			}
+		case <-ctx.Done():
+			p.log.Info("Listen Updater beendet")
+			return
+		}
+	}
+}
+
+// updateAllLists aktualisiert alle Listen
+func (p *vpnProxyPlugin) updateAllLists() error {
+	p.log.Info("Aktualisiere VPN/Proxy-Listen...")
+
+	// ASN-Listen laden
+	asnPatterns, err := p.loadTextLists(p.asnListURLs, "AS")
+	if err != nil {
+		p.log.Error(err, "Fehler beim Laden der ASN-Listen")
+	}
+
+	// ISP-Listen laden
+	ispPatterns, err := p.loadTextLists(p.ispListURLs, "")
+	if err != nil {
+		p.log.Error(err, "Fehler beim Laden der ISP-Listen")
+	}
+
+	// IP-Liste laden
+	ipList, err := p.loadIPList()
+	if err != nil {
+		p.log.Error(err, "Fehler beim Laden der IP-Liste")
+	}
+
+	// Regex-Listen erstellen
+	asnRegexes := make([]*regexp.Regexp, 0, len(asnPatterns))
+	for _, pattern := range asnPatterns {
+		if regex := wildcardToRegex(pattern); regex != nil {
+			asnRegexes = append(asnRegexes, regex)
+		}
+	}
+
+	ispRegexes := make([]*regexp.Regexp, 0, len(ispPatterns))
+	for _, pattern := range ispPatterns {
+		if regex := wildcardToRegex(pattern); regex != nil {
+			ispRegexes = append(ispRegexes, regex)
+		}
+	}
+
+	// IP-Map erstellen
+	ipMap := make(map[string]bool)
+	for _, ip := range ipList {
+		ipMap[ip] = true
+	}
+
+	// Atomisch aktualisieren
+	p.listMutex.Lock()
+	p.asnRegexList = asnRegexes
+	p.ispRegexList = ispRegexes
+	p.blockedIPs = ipMap
+	p.listMutex.Unlock()
+
+	p.log.Info("Listen erfolgreich aktualisiert",
+		"asnPatterns", len(asnRegexes),
+		"ispPatterns", len(ispRegexes),
+		"blockedIPs", len(ipMap))
+
+	return nil
+}
+
+// loadTextLists lädt Text-Listen von URLs
+func (p *vpnProxyPlugin) loadTextLists(urls []string, prefix string) ([]string, error) {
+	var allPatterns []string
+
+	for _, url := range urls {
+		patterns, err := p.loadTextFromURL(url, prefix)
+		if err != nil {
+			p.log.Error(err, "Fehler beim Laden der Liste", "url", url)
+			continue
+		}
+		allPatterns = append(allPatterns, patterns...)
+	}
+
+	return allPatterns, nil
+}
+
+// loadTextFromURL lädt Text von einer URL
+func (p *vpnProxyPlugin) loadTextFromURL(url, prefix string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("User-Agent", "VPNProxyDetector/1.0")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // Max 10MB
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(body), "\n")
+	var patterns []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Prüfe Prefix-Filter
+		if prefix != "" {
+			if !strings.HasPrefix(strings.ToUpper(line), prefix) {
+				continue
+			}
+		}
+
+		patterns = append(patterns, line)
+	}
+
+	return patterns, nil
+}
+
+// loadIPList lädt die IP-Liste
+func (p *vpnProxyPlugin) loadIPList() ([]string, error) {
+	ips, err := p.loadTextFromURL(p.ipListURL, "")
+	if err != nil {
+		return nil, err
+	}
+
+	// Validiere IPs
+	var validIPs []string
+	for _, ip := range ips {
+		if net.ParseIP(ip) != nil {
+			validIPs = append(validIPs, ip)
+		}
+	}
+
+	return validIPs, nil
+}
+
+// wildcardToRegex konvertiert Wildcard-Pattern zu Regex
+func wildcardToRegex(pattern string) *regexp.Regexp {
+	// Escape spezielle Regex-Zeichen, außer *
+	escaped := regexp.QuoteMeta(pattern)
+	// Ersetze \* durch .*
+	escaped = strings.ReplaceAll(escaped, "\\*", ".*")
+	// Füge Anker hinzu
+	regexPattern := "^" + escaped + "$"
+	
+	regex, err := regexp.Compile("(?i)" + regexPattern) // Case-insensitive
+	if err != nil {
+		return nil
+	}
+	return regex
+}
+
+// Hilfsfunktionen (aus dem ursprünglichen Plugin übernommen)
+
+func extractIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+
+	var ipStr string
+	switch v := addr.(type) {
+	case *net.TCPAddr:
+		ipStr = v.IP.String()
+	case *net.UDPAddr:
+		ipStr = v.IP.String()
+	default:
+		addrStr := addr.String()
+		host, _, err := net.SplitHostPort(addrStr)
+		if err != nil {
+			ipStr = addrStr
+		} else {
+			ipStr = host
+		}
+	}
+
+	if net.ParseIP(ipStr) != nil {
+		return ipStr
+	}
+	return ""
+}
+
+func isPrivateIP(ip net.IP) bool {
+	privateIPv4Blocks := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+	}
+
+	privateIPv6Blocks := []string{
+		"fc00::/7",
+		"fe80::/10",
+		"::1/128",
+	}
+
+	if ip.To4() != nil {
+		for _, block := range privateIPv4Blocks {
+			_, cidr, err := net.ParseCIDR(block)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+	} else {
+		for _, block := range privateIPv6Blocks {
+			_, cidr, err := net.ParseCIDR(block)
+			if err == nil && cidr.Contains(ip) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func tryGetRemoteAddr(e interface{}) string {
+	type remoteAddressProvider interface {
+		RemoteAddr() net.Addr
+	}
+	if provider, ok := e.(remoteAddressProvider); ok {
+		return extractIP(provider.RemoteAddr())
+	}
+
+	type connectionProvider interface {
+		Connection() interface{ RemoteAddr() net.Addr }
+	}
+	if provider, ok := e.(connectionProvider); ok {
+		if conn := provider.Connection(); conn != nil {
+			return extractIP(conn.RemoteAddr())
+		}
+	}
+
+	type initialConnectionProvider interface {
+		InitialConnection() interface{ RemoteAddr() net.Addr }
+	}
+	if provider, ok := e.(initialConnectionProvider); ok {
+		if conn := provider.InitialConnection(); conn != nil {
+			return extractIP(conn.RemoteAddr())
+		}
+	}
+
+	return ""
+}
+
+func tryGetVirtualHost(e interface{}) string {
+	type virtualHostProvider interface {
+		VirtualHost() interface{ String() string }
+	}
+	if provider, ok := e.(virtualHostProvider); ok {
+		if vh := provider.VirtualHost(); vh != nil {
+			return vh.String()
+		}
+	}
+
+	return "unbekannt"
+}
+
+func tryDisconnect(e interface{}, reason c.Component) {
+	type disconnector interface {
+		Disconnect(c.Component)
+	}
+	if d, ok := e.(disconnector); ok {
+		d.Disconnect(reason)
+		return
+	}
+
+	type connectionProvider interface {
+		Connection() interface{ Disconnect(c.Component) }
+	}
+	if provider, ok := e.(connectionProvider); ok {
+		if conn := provider.Connection(); conn != nil {
+			conn.Disconnect(reason)
+			return
+		}
+	}
+
+	type playerProvider interface {
+		Player() interface{ Disconnect(c.Component) }
+	}
+	if provider, ok := e.(playerProvider); ok {
+		if player := provider.Player(); player != nil {
+			player.Disconnect(reason)
+			return
+		}
+	}
+}
