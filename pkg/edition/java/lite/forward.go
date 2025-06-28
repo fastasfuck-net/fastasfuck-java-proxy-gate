@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"go.minekube.com/common/minecraft/component"
 	"github.com/go-logr/logr"
 	"github.com/jellydator/ttlcache/v3"
 	"go.minekube.com/gate/pkg/edition/java/internal/protoutil"
