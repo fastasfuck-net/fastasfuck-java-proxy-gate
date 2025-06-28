@@ -1,74 +1,94 @@
 package ipblacklist
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 
-	"github.com/go-logr/logr"
-	"github.com/robinbraemer/event"
-	"go.minekube.com/common/minecraft/component"
-	"go.minekube.com/gate/pkg/edition/java/proxy"
+	"go.minekube.com/gate/pkg/gate"
+	"go.minekube.com/gate/pkg/gate/plugin"
+	"go.minekube.com/gate/pkg/edition/java"
 )
 
-var Plugin = proxy.Plugin{
-	Name: "IPBlacklistVPNCheck",
-	Init: func(ctx context.Context, p *proxy.Proxy) error {
-		log := logr.FromContextOrDiscard(ctx)
-		log.Info("VPN Blacklist Plugin wird initialisiert...")
-
-		event.Subscribe(p.Event(), 0, func(e event.Event) {
-			if login, ok := e.(*proxy.LoginEvent); ok {
-				ip := extractIP(login.Player().RemoteAddr())
-				go checkAndDisconnect(ip, login, log)
-			}
-		})
-
-		log.Info("VPN Blacklist Plugin erfolgreich aktiviert")
-		return nil
-	},
-}
-
-func extractIP(addr net.Addr) string {
-	if addr == nil {
-		return ""
-	}
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		return addr.String()
-	}
-	return host
-}
-
+// Struktur zum Parsen der JSON-Antwort
 type vpnResponse struct {
-	VPN bool `json:"vpn"`
+	IP      string `json:"ip"`
+	IsVPN   bool   `json:"isVPN"`
+	Details struct {
+		ASN      string `json:"asn"`
+		ASNOrg   string `json:"asnOrg"`
+		ISP      string `json:"isp"`
+		Hostname string `json:"hostname"`
+		ASNMatch bool   `json:"asnMatch"`
+		ISPMatch bool   `json:"ispMatch"`
+		IPListed bool   `json:"ipListed"`
+	} `json:"details"`
 }
 
-func checkAndDisconnect(ip string, login *proxy.LoginEvent, log logr.Logger) {
-	if ip == "" {
-		return
-	}
+// Plugin-Struktur
+type Plugin struct {
+	plugin.Instance
+}
 
+// Registrierung beim Gate-Plugin-System
+func NewPlugin(p *plugin.Registration) error {
+	return plugin.Init(p, &Plugin{})
+}
+
+// Plugin-Initialisierung
+func (p *Plugin) Init(ctx *plugin.Context, g *gate.Gate) error {
+	log.Println("[ipblacklist] Plugin aktiviert.")
+
+	// Spieler-Login-Event abonnieren
+	g.EventBus().Subscribe(ctx, func(e *java.LoginEvent) {
+		go func() {
+			addr := e.Connection().RemoteAddr()
+			ip, _, err := net.SplitHostPort(addr.String())
+			if err != nil {
+				log.Printf("[ipblacklist] Fehler beim Parsen der IP: %v", err)
+				return
+			}
+
+			resp, err := checkVPN(ip)
+			if err != nil {
+				log.Printf("[ipblacklist] Fehler beim VPN-Check: %v", err)
+				return
+			}
+
+			if resp.IsVPN {
+				log.Printf("[ipblacklist] Verbindung von VPN (%s) blockiert.", ip)
+				e.Connection().Disconnect("Verbindung über VPN nicht erlaubt.")
+			} else {
+				log.Printf("[ipblacklist] Verbindung von %s erlaubt (kein VPN).", ip)
+			}
+		}()
+	})
+
+	return nil
+}
+
+// VPN-Prüfung über die otp.cx-API
+func checkVPN(ip string) (*vpnResponse, error) {
 	url := fmt.Sprintf("https://vpn.otp.cx/check?ip=%s", ip)
+
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Error(err, "Fehler beim Abrufen der VPN-Check-API", "ip", ip)
-		return
+		return nil, fmt.Errorf("HTTP-Fehler: %w", err)
 	}
 	defer resp.Body.Close()
 
-	var data vpnResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		log.Error(err, "Fehler beim Parsen der Antwort", "ip", ip)
-		return
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Fehler beim Lesen des API-Response: %w", err)
 	}
 
-	if data.isVPN {
-		log.Info("Verbindung von VPN blockiert", "ip", ip)
-		login.Player().Disconnect(&component.Text{
-			Content: "Verbindungen über VPN sind nicht erlaubt.",
-		})
+	var data vpnResponse
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("Fehler beim Parsen des JSON: %w", err)
 	}
+
+	return &data, nil
 }
