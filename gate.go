@@ -6,7 +6,6 @@ import (
 	"go.minekube.com/gate/pkg/plugins/ipblacklist"
 	"go.minekube.com/gate/pkg/plugins/configdownloader"
 	"go.minekube.com/gate/pkg/plugins/antivpn"
-	"go.minekube.com/gate/pkg/plugins/nobackendserver"
 )
 
 func main() {
@@ -22,4 +21,3 @@ func main() {
 	gate.Execute()
 	
 }
-WARUM STARTEN DIE NICHT GLEICHZEITIG
