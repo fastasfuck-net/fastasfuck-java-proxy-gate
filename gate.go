@@ -7,7 +7,6 @@ import (
 	"go.minekube.com/gate/pkg/plugins/configdownloader"
 	"go.minekube.com/gate/pkg/plugins/antivpn"
 	"go.minekube.com/gate/pkg/plugins/nobackendserver"
-	"log"
 )
 
 func main() {
@@ -18,18 +17,9 @@ func main() {
 		antivpn.Plugin,
 	)
 
-	// Start Gate proxy in a goroutine
-	go func() {
-		log.Println("Starting Gate proxy...")
-		gate.Execute()
-	}()
-
-	// Start the nobackendserver in a goroutine
-	go func() {
-		log.Println("Starting nobackendserver...")
-		nobackendserver.StartServer()
-	}()
-
-	// Wait indefinitely to keep both servers running
-	select {}
+	// Start Gate proxy
+	log.Println("successfully finished startup")
+	gate.Execute()
+	
 }
+WARUM STARTEN DIE NICHT GLEICHZEITIG
