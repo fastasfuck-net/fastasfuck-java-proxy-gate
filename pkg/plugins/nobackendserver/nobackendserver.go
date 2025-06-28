@@ -3,164 +3,176 @@ package nobackendserver
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
-	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
+	"os"
 )
 
 const (
-	port       = 25566
-	motd       = "§aMini-Server §7» §eNur Ping & Kick"
-	kickReason = "§cDu wurdest gekickt!"
+	portb       = 25566
+	motdb       = "§aMini-Server §7» §eNur Ping & Kick"
+	kickReasonb = "§cDu wurdest gekickt!"
 )
 
 func main() {
-	addr := fmt.Sprintf(":%d", port)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("Fehler beim Starten: %v", err)
+	listenerb, errb := net.Listen("tcp", ":25566")
+	if errb != nil {
+		log.Fatalf("Fehler beim Starten: %v", errb)
 	}
-	defer listener.Close()
+	log.Println("Fake-Server läuft auf Port 25566...")
 
-	log.Printf("Fake-Minecraft-Server läuft auf %s", addr)
-
-	icon := loadServerIcon()
+	iconb := loadServerIconb()
 
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
+		connb, errb := listenerb.Accept()
+		if errb != nil {
+			log.Printf("Verbindungsfehler: %v", errb)
 			continue
 		}
-		go handleConnection(conn, icon)
+		go handleConnectionb(connb, iconb)
 	}
 }
 
-func loadServerIcon() string {
-	data, err := ioutil.ReadFile("server-icon.png")
-	if err != nil {
-		log.Println("Hinweis: Keine server-icon.png gefunden.")
+func loadServerIconb() string {
+	datab, errb := os.ReadFile("server-icon.png")
+	if errb != nil {
+		log.Println("Hinweis: server-icon.png nicht gefunden:", errb)
 		return ""
 	}
-	encoded := base64.StdEncoding.EncodeToString(data)
-	return "data:image/png;base64," + encoded
+	encodedb := base64.StdEncoding.EncodeToString(datab)
+	return "data:image/png;base64," + encodedb
 }
 
-func handleConnection(conn net.Conn, icon string) {
-	defer conn.Close()
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil {
+func handleConnectionb(connb net.Conn, iconb string) {
+	defer connb.Close()
+
+	bufb := make([]byte, 512)
+	_, errb := connb.Read(bufb)
+	if errb != nil {
+		log.Printf("Fehler beim Lesen: %v", errb)
 		return
 	}
 
-	packet := bytes.NewBuffer(buf[:n])
-	_, _ = readVarInt(packet)       // Packet length
-	packetID, _ := readVarInt(packet)
+	packetb := bytes.NewBuffer(bufb)
+	_, _ = readVarIntb(packetb)     // packet length
+	packetIDb, _ := readVarIntb(packetb) // packet id
 
-	if packetID == 0x00 { // Handshake
-		_, _ = readVarInt(packet)        // Protocol version
-		_ = readString(packet)           // Server address
-		_, _ = readUnsignedShort(packet) // Port
-		nextState, _ := readVarInt(packet)
-		if nextState == 1 {
-			handleStatus(conn, icon)
-		} else if nextState == 2 {
-			handleLogin(conn)
+	if packetIDb == 0x00 { // Handshake
+		_, _ = readVarIntb(packetb) // protocol version
+		_ = readStringb(packetb)   // server address
+		_, _ = readUnsignedShortb(packetb)
+		nextStateb, _ := readVarIntb(packetb)
+
+		// Status
+		if nextStateb == 1 {
+			handleStatusb(connb, iconb)
+		} else if nextStateb == 2 {
+			handleLoginb(connb)
 		}
 	}
 }
 
-func handleStatus(conn net.Conn, icon string) {
-	status := map[string]interface{}{
+func handleStatusb(connb net.Conn, iconb string) {
+	bufb := make([]byte, 512)
+	_, errb := connb.Read(bufb)
+	if errb != nil {
+		log.Printf("Fehler beim Lesen (Status): %v", errb)
+		return
+	}
+
+	resp := map[string]interface{}{
 		"version": map[string]interface{}{
-			"name":     "§cUnknown Version",
-			"protocol": -1,
+			"name":     "1.20.1",
+			"protocol": 763,
 		},
 		"players": map[string]interface{}{
 			"max":    0,
 			"online": 0,
 		},
-		"description": map[string]interface{}{
-			"text": motd,
+		"description": map[string]string{
+			"text": motdb,
 		},
 	}
-	if icon != "" {
-		status["favicon"] = icon
+	if iconb != "" {
+		resp["favicon"] = iconb
 	}
 
-	data, _ := json.Marshal(status)
-	sendPacket(conn, 0x00, data)
+	respJSONb, _ := json.Marshal(resp)
+	respPacketb := new(bytes.Buffer)
+	writeVarIntb(respPacketb, len(respJSONb))
+	respPacketb.Write(respJSONb)
 
-	// Antwort auf Ping
-	buf := make([]byte, 512)
-	conn.Read(buf)
-	sendPacket(conn, 0x01, buf[3:]) // Pong-Paket mit gleichem Payload
+	sendPacketb(connb, 0x00, respPacketb.Bytes())
+
+	// Ping zurücksenden
+	connb.Read(bufb)
+	connb.Write(bufb)
 }
 
-func handleLogin(conn net.Conn) {
-	// Sofortiger Kick beim Join
-	msg := map[string]string{"text": kickReason}
-	data, _ := json.Marshal(msg)
-	sendPacket(conn, 0x00, data)
+func handleLoginb(connb net.Conn) {
+	bufb := new(bytes.Buffer)
+	writeVarIntb(bufb, len(kickReasonb)+3)
+	bufb.WriteByte(0x00) // packet id
+	writeVarIntb(bufb, len(kickReasonb))
+	bufb.WriteString(kickReasonb)
+
+	connb.Write(bufb.Bytes())
 }
 
-func sendPacket(conn net.Conn, packetID byte, data []byte) {
-	packet := &bytes.Buffer{}
-	writeVarInt(packet, int(packetID))
-	packet.Write(data)
+func sendPacketb(connb net.Conn, packetIDb byte, datab []byte) {
+	fullb := new(bytes.Buffer)
+	packetb := new(bytes.Buffer)
 
-	full := &bytes.Buffer{}
-	writeVarInt(full, packet.Len())
-	full.Write(packet.Bytes())
+	packetb.WriteByte(packetIDb)
+	packetb.Write(datab)
 
-	conn.Write(full.Bytes())
+	writeVarIntb(fullb, packetb.Len())
+	fullb.Write(packetb.Bytes())
+
+	connb.Write(fullb.Bytes())
 }
 
-// --- Hilfsfunktionen für das Minecraft-Protokoll ---
-
-func readVarInt(buf *bytes.Buffer) (int, error) {
-	var num int
-	var shift uint
+func readVarIntb(bufb *bytes.Buffer) (int, error) {
+	var valueb int
+	var shiftb uint
 	for {
-		b, err := buf.ReadByte()
-		if err != nil {
-			return 0, err
+		bb, errb := bufb.ReadByte()
+		if errb != nil {
+			return 0, errb
 		}
-		num |= int(b&0x7F) << shift
-		if b&0x80 == 0 {
+		valueb |= int(bb&0x7F) << shiftb
+		if bb&0x80 == 0 {
 			break
 		}
-		shift += 7
+		shiftb += 7
 	}
-	return num, nil
+	return valueb, nil
 }
 
-func readUnsignedShort(buf *bytes.Buffer) (uint16, error) {
-	b := make([]byte, 2)
-	if _, err := buf.Read(b); err != nil {
-		return 0, err
-	}
-	return uint16(b[0])<<8 | uint16(b[1]), nil
+func readUnsignedShortb(bufb *bytes.Buffer) (uint16, error) {
+	var b [2]byte
+	_, errb := bufb.Read(b[:])
+	return binary.BigEndian.Uint16(b[:]), errb
 }
 
-func readString(buf *bytes.Buffer) string {
-	length, _ := readVarInt(buf)
-	b := make([]byte, length)
-	buf.Read(b)
-	return string(b)
+func readStringb(bufb *bytes.Buffer) string {
+	lengthb, _ := readVarIntb(bufb)
+	sb := make([]byte, lengthb)
+	_, _ = bufb.Read(sb)
+	return string(sb)
 }
 
-func writeVarInt(buf *bytes.Buffer, value int) {
+func writeVarIntb(bufb *bytes.Buffer, valueb int) {
 	for {
-		temp := byte(value & 0x7F)
-		value >>= 7
-		if value != 0 {
-			temp |= 0x80
+		tempb := byte(valueb & 0x7F)
+		valueb >>= 7
+		if valueb != 0 {
+			tempb |= 0x80
 		}
-		buf.WriteByte(temp)
-		if value == 0 {
+		bufb.WriteByte(tempb)
+		if valueb == 0 {
 			break
 		}
 	}
