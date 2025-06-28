@@ -15,9 +15,9 @@ func main() {
 		ipblacklist.Plugin,
 		configdownloader.Plugin,
 		antivpn.Plugin,
-		nobackendserver.Plugin, 
 	)
 
 	// Start Gate proxy
 	gate.Execute()
+	nobackendserver.StartServer()
 }
