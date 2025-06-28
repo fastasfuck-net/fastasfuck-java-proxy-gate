@@ -3,6 +3,7 @@ package nobackendserver
 import (
 	"fmt"
 	"net"
+	"log"
 )
 
 // Server-Konfiguration
@@ -24,11 +25,21 @@ func handleConnection(conn net.Conn, icon string) {
 	defer conn.Close()
 
 	// Sende Server-MOTD und Icon
-	conn.Write([]byte(motd + "\n"))
-	conn.Write([]byte(icon))
+	if _, err := conn.Write([]byte(motd + "\n")); err != nil {
+		log.Printf("Fehler beim Senden der MOTD: %v\n", err)
+		return
+	}
+
+	if _, err := conn.Write([]byte(icon)); err != nil {
+		log.Printf("Fehler beim Senden des Icons: %v\n", err)
+		return
+	}
 
 	// Kicke den Benutzer nach dem Joinen
-	conn.Write([]byte(kickReason))
+	if _, err := conn.Write([]byte(kickReason)); err != nil {
+		log.Printf("Fehler beim Senden der Kick-Nachricht: %v\n", err)
+		return
+	}
 }
 
 // Funktion zum Starten des Servers
@@ -36,17 +47,17 @@ func StartServer() {
 	// Server lauscht auf Port 25566
 	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		fmt.Printf("Fehler beim Starten des Servers: %v\n", err)
+		log.Printf("Fehler beim Starten des Servers: %v\n", err)
 		return
 	}
 	defer listen.Close()
-	fmt.Printf("Server läuft auf Port %d...\n", port)
+	log.Printf("Server läuft auf Port %d...\n", port)
 
 	// Verbindungen akzeptieren und behandeln
 	for {
 		conn, err := listen.Accept()
 		if err != nil {
-			fmt.Printf("Verbindungsfehler: %v\n", err)
+			log.Printf("Verbindungsfehler: %v\n", err)
 			continue
 		}
 
