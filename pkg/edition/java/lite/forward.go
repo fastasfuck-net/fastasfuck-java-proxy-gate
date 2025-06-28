@@ -102,6 +102,17 @@ func tryBackends[T any](next nextBackendFunc, try func(log logr.Logger, backendA
 	}
 }
 
+func sendDisconnect(client netmc.MinecraftConn, reason string, protocol proto.Protocol) {
+	disconnectPacket := packet.NewDisconnect(
+		&component.Text{Content: reason}, 
+		protocol, 
+		states.LoginState,
+	)
+	
+	// Versuche das Disconnect-Packet zu senden
+	_ = client.WritePacket(disconnectPacket)
+}
+
 func emptyReadBuff(src netmc.MinecraftConn, dst net.Conn) error {
 	buf, ok := src.(interface{ ReadBuffered() ([]byte, error) })
 	if ok {
