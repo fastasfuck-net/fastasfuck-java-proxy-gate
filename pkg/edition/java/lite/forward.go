@@ -25,7 +25,6 @@ import (
 	"go.minekube.com/gate/pkg/util/errs"
 	"go.minekube.com/gate/pkg/util/netutil"
 	"go.minekube.com/gate/pkg/component"
-        "go.minekube.com/gate/pkg/util/states"
 	"golang.org/x/sync/singleflight"
 )
 
