@@ -15,11 +15,9 @@ func main() {
 		ipblacklist.Plugin,
 		configdownloader.Plugin,
 		antivpn.Plugin,
+		nobackendserver.Plugin, // ✅ hier wird dein Plugin korrekt registriert
 	)
-	
-	// Start Gate
-	gate.Execute()
 
-	// starts the nobackend server
-        nobackendserver.main()
+	// Start Gate proxy
+	gate.Execute()
 }
