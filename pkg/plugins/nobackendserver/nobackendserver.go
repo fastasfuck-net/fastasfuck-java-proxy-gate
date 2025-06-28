@@ -1,141 +1,69 @@
-package nobackendserver
+package main
 
 import (
 	"bytes"
-	"context"
-	"encoding/base64"
-	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
-
-	"go.minekube.com/gate/pkg/edition/java"
 )
 
-var Plugin = java.PluginFunc(startFakeServer)
-
-func startFakeServer(ctx context.Context, srv *java.Server) error {
-	go func() {
-		listener, err := net.Listen("tcp", ":25566")
-		if err != nil {
-			log.Println("Fehler beim Starten des Fake-Servers:", err)
-			return
-		}
-		log.Println("Fake-Server läuft auf Port 25566...")
-
-		iconb := loadServerIconB()
-
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				log.Println("Verbindungsfehler:", err)
-				continue
-			}
-			go handleConnectionB(conn, iconb)
-		}
-	}()
-	return nil
-}
-
-// Einstellungen
+// Server-Konfiguration
 const (
-	motdB       = "§aMini-Server §7» §eNur Ping & Kick"
-	kickReasonB = "§cDu wurdest gekickt!"
+	port       = 25566
+	motd       = "§aMini-Server §7» §eNur Ping & Kick"
+	kickReason = "§cDu wurdest gekickt!"
 )
 
-func loadServerIconB() string {
-	data, err := os.ReadFile("server-icon.png")
-	if err != nil {
-		log.Println("Fehler beim Laden des Server-Icons:", err)
-		return ""
-	}
-	encoded := base64.StdEncoding.EncodeToString(data)
-	return "data:image/png;base64," + encoded
+// Funktion zum Laden des Server-Icons (nur ein Platzhalter)
+func loadServerIcon() string {
+	// Hier kannst du das tatsächliche Server-Icon laden
+	// Zum Beispiel: Dateisystem, DB, etc.
+	return "data:image/png;base64,..."
 }
 
-func handleConnectionB(conn net.Conn, icon string) {
+// Hauptverbindungsbehandlung
+func handleConnection(conn net.Conn, icon string) {
 	defer conn.Close()
 
-	buf := make([]byte, 512)
-	n, err := conn.Read(buf)
+	// Hier sendest du ein MOTD und Icon
+	fmt.Println("Neue Verbindung:", conn.RemoteAddr())
+
+	// Sende Server-MOTD und Icon
+	conn.Write([]byte(motd + "\n"))
+	conn.Write([]byte(icon))
+
+	// Kicke den Benutzer nach dem Joinen
+	conn.Write([]byte(kickReason))
+}
+
+// Server-Startfunktion
+func startServer() {
+	// Server lauscht auf Port 25566
+	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		return
+		log.Fatalf("Fehler beim Starten des Servers: %v", err)
 	}
-	packet := buf[:n]
+	defer listen.Close()
+	log.Printf("Server läuft auf Port %d...", port)
 
-	if len(packet) < 2 {
-		return
-	}
-
-	// Status request
-	if packet[1] == 0x00 {
-		handleStatusB(conn, icon)
-		return
-	}
-
-	// Login start (Join-Versuch)
-	if packet[1] == 0x00 && len(packet) > 2 {
-		handleLoginB(conn)
-	}
-}
-
-func handleStatusB(conn net.Conn, icon string) {
-	resp := map[string]interface{}{
-		"version": map[string]interface{}{
-			"name":     "Any",
-			"protocol": 999, // akzeptiert alle
-		},
-		"players": map[string]interface{}{
-			"max":    1,
-			"online": 0,
-		},
-		"description": map[string]interface{}{
-			"text": motdB,
-		},
-	}
-
-	if icon != "" {
-		resp["favicon"] = icon
-	}
-
-	b, _ := json.Marshal(resp)
-	var full bytes.Buffer
-	writeVarIntB(&full, len(b)+1)
-	full.WriteByte(0x00)
-	full.Write(b)
-
-	conn.Write(full.Bytes())
-
-	// Antwort auf Ping (Time)
-	timeBuf := make([]byte, 8)
-	conn.Read(timeBuf)
-	conn.Write(timeBuf)
-}
-
-func handleLoginB(conn net.Conn) {
-	var full bytes.Buffer
-	msg := map[string]interface{}{
-		"text": kickReasonB,
-	}
-	b, _ := json.Marshal(msg)
-
-	writeVarIntB(&full, len(b)+1)
-	full.WriteByte(0x00)
-	full.Write(b)
-
-	conn.Write(full.Bytes())
-}
-
-func writeVarIntB(buf *bytes.Buffer, value int) {
+	// Verbindungsannahme und Handhabung
 	for {
-		temp := byte(value & 0x7F)
-		value >>= 7
-		if value != 0 {
-			temp |= 0x80
+		conn, err := listen.Accept()
+		if err != nil {
+			log.Printf("Verbindungsfehler: %v", err)
+			continue
 		}
-		buf.WriteByte(temp)
-		if value == 0 {
-			break
-		}
+
+		// Lade Server-Icon
+		icon := loadServerIcon()
+
+		// Verarbeite die eingehende Verbindung
+		go handleConnection(conn, icon)
 	}
+}
+
+func main() {
+	// Starte den Server
+	startServer()
 }
