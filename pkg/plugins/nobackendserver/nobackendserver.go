@@ -5,11 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"io"
 	"log"
 	"net"
 	"os"
-	"time"
 
 	"go.minekube.com/gate/pkg/edition/java"
 )
