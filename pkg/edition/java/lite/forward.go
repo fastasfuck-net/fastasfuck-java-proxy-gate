@@ -41,6 +41,7 @@ func Forward(
 
 	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake)
 	if err != nil {
+		sendDisconnect(client, "Server nicht gefunden", pc.Protocol)
 		errs.V(log, err).Info("failed to find route", "error", err)
 		return
 	}
@@ -51,6 +52,7 @@ func Forward(
 	// Extrahiere die Client-IP und prüfe auf Blacklist
 	clientIP, _, err := net.SplitHostPort(src.RemoteAddr().String())
 	if err == nil && blacklist.CheckIP(clientIP) {
+		sendDisconnect(client, "Du bist gesperrt", pc.Protocol)
 		log.Info("Connection rejected - IP is blacklisted")
 		return
 	}
