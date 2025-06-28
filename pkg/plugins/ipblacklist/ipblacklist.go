@@ -325,39 +325,7 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 	}
 }
 
-// getStats gibt aktuelle Statistiken zurück
-func (p *vpnProxyPlugin) getStats() connectionStats {
-	p.statsMutex.RLock()
-	defer p.statsMutex.RUnlock()
-	return *p.stats
-}
 
-// logStats loggt aktuelle Statistiken
-func (p *vpnProxyPlugin) logStats() {
-	stats := p.getStats()
-	uptime := time.Since(stats.StartTime)
-
-	blockRate := float64(0)
-	if stats.TotalConnections > 0 {
-		blockRate = float64(stats.BlockedConnections) / float64(stats.TotalConnections) * 100
-	}
-
-	cacheSize := 0
-	p.cacheMutex.RLock()
-	cacheSize = len(p.cache)
-	p.cacheMutex.RUnlock()
-
-	p.log.Info("=== VPN/Proxy Detection Statistiken ===",
-		"uptime", uptime.Round(time.Minute),
-		"totalConnections", stats.TotalConnections,
-		"allowedConnections", stats.AllowedConnections,
-		"blockedConnections", stats.BlockedConnections,
-		"blockRate", fmt.Sprintf("%.2f%%", blockRate),
-		"apiRequests", stats.APIRequests,
-		"cacheHits", stats.CacheHits,
-		"apiErrors", stats.APIErrors,
-		"cacheSize", cacheSize)
-}
 
 // Hilfsfunktionen
 
