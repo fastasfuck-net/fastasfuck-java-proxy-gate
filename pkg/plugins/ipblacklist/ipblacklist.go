@@ -1,94 +1,126 @@
 package ipblacklist
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"net/http"
+	"time"
 
-	"go.minekube.com/gate/pkg/gate"
-	"go.minekube.com/gate/pkg/gate/plugin"
-	"go.minekube.com/gate/pkg/edition/java"
+	"github.com/go-logr/logr"
+	"github.com/robinbraemer/event"
+	c "go.minekube.com/common/minecraft/component"
+	"go.minekube.com/gate/pkg/edition/java/proxy"
 )
 
-// Struktur zum Parsen der JSON-Antwort
-type vpnResponse struct {
+var Plugin = proxy.Plugin{
+	Name: "VPNCheck",
+	Init: func(ctx context.Context, p *proxy.Proxy) error {
+		log := logr.FromContextOrDiscard(ctx)
+		log.Info("VPNCheck Plugin wird initialisiert...")
+
+		plugin := &vpnCheckPlugin{
+			log:          log,
+			blockMessage: "VPN-Verbindungen sind nicht erlaubt auf diesem Server.",
+			apiURL:       "https://vpn.otp.cx/check?ip=",
+		}
+
+		event.Subscribe(p.Event(), 0, plugin.handleEvent)
+		log.Info("VPNCheck Plugin erfolgreich initialisiert.")
+		return nil
+	},
+}
+
+type vpnCheckPlugin struct {
+	log          logr.Logger
+	blockMessage string
+	apiURL       string
+}
+
+type vpnCheckResponse struct {
 	IP      string `json:"ip"`
 	IsVPN   bool   `json:"isVPN"`
-	Details struct {
-		ASN      string `json:"asn"`
-		ASNOrg   string `json:"asnOrg"`
-		ISP      string `json:"isp"`
-		Hostname string `json:"hostname"`
-		ASNMatch bool   `json:"asnMatch"`
-		ISPMatch bool   `json:"ispMatch"`
-		IPListed bool   `json:"ipListed"`
-	} `json:"details"`
+	Details any    `json:"details"` // optional, falls du es loggen möchtest
 }
 
-// Plugin-Struktur
-type Plugin struct {
-	plugin.Instance
-}
+func (p *vpnCheckPlugin) handleEvent(e event.Event) {
+	loginEvent, ok := e.(*proxy.LoginEvent)
+	if !ok {
+		return
+	}
 
-// Registrierung beim Gate-Plugin-System
-func NewPlugin(p *plugin.Registration) error {
-	return plugin.Init(p, &Plugin{})
-}
+	player := loginEvent.Player()
+	ip := extractIP(player.RemoteAddr())
 
-// Plugin-Initialisierung
-func (p *Plugin) Init(ctx *plugin.Context, g *gate.Gate) error {
-	log.Println("[ipblacklist] Plugin aktiviert.")
+	if ip == "" || isPrivateIP(net.ParseIP(ip)) {
+		return
+	}
 
-	// Spieler-Login-Event abonnieren
-	g.EventBus().Subscribe(ctx, func(e *java.LoginEvent) {
-		go func() {
-			addr := e.Connection().RemoteAddr()
-			ip, _, err := net.SplitHostPort(addr.String())
-			if err != nil {
-				log.Printf("[ipblacklist] Fehler beim Parsen der IP: %v", err)
-				return
-			}
-
-			resp, err := checkVPN(ip)
-			if err != nil {
-				log.Printf("[ipblacklist] Fehler beim VPN-Check: %v", err)
-				return
-			}
-
-			if resp.IsVPN {
-				log.Printf("[ipblacklist] Verbindung von VPN (%s) blockiert.", ip)
-				e.Connection().Disconnect("Verbindung über VPN nicht erlaubt.")
-			} else {
-				log.Printf("[ipblacklist] Verbindung von %s erlaubt (kein VPN).", ip)
-			}
-		}()
-	})
-
-	return nil
-}
-
-// VPN-Prüfung über die otp.cx-API
-func checkVPN(ip string) (*vpnResponse, error) {
-	url := fmt.Sprintf("https://vpn.otp.cx/check?ip=%s", ip)
-
-	resp, err := http.Get(url)
+	// Anfrage an vpn.otp.cx
+	isVPN, err := p.checkVPN(ip)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP-Fehler: %w", err)
+		p.log.Error(err, "Fehler beim Prüfen der IP", "ip", ip)
+		return
+	}
+
+	if isVPN {
+		p.log.Info("VPN blockiert", "ip", ip, "name", player.Username())
+		player.Disconnect(&c.Text{Content: p.blockMessage})
+	}
+}
+
+func (p *vpnCheckPlugin) checkVPN(ip string) (bool, error) {
+	url := p.apiURL + ip
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return false, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	var result vpnCheckResponse
+	err = json.NewDecoder(resp.Body).Decode(&result)
 	if err != nil {
-		return nil, fmt.Errorf("Fehler beim Lesen des API-Response: %w", err)
+		return false, err
 	}
 
-	var data vpnResponse
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, fmt.Errorf("Fehler beim Parsen des JSON: %w", err)
-	}
+	return result.IsVPN, nil
+}
 
-	return &data, nil
+func extractIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	switch v := addr.(type) {
+	case *net.TCPAddr:
+		return v.IP.String()
+	case *net.UDPAddr:
+		return v.IP.String()
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return addr.String()
+		}
+		return host
+	}
+}
+
+func isPrivateIP(ip net.IP) bool {
+	privateBlocks := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+		"fc00::/7",
+		"fe80::/10",
+	}
+	for _, block := range privateBlocks {
+		_, cidr, _ := net.ParseCIDR(block)
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
