@@ -54,7 +54,8 @@ func Forward(
 	// Extrahiere die Client-IP und prüfe auf Blacklist
 	clientIP, _, err := net.SplitHostPort(src.RemoteAddr().String())
 	if err == nil && blacklist.CheckIP(clientIP) {
-		sendDisconnect(client, "§c§lFastAsFuck §7- §4DDoS Protection\n§7We have detected a §cVPN §7or §cProxy§7.\n§7If you're not using one, you can appeal on our Discord:\n§9dc.otp.cx", pc.Protocol)
+		sendDisconnect(client, "§c§lConnection Blocked §7- §4DDoS Protection\n\n§7Your connection was flagged as a §cVPN §7or §cProxy.\n\n§7Not using one? Appeal on Discord:\n§9dc.otp.cx
+", pc.Protocol)
 		log.Info("Connection rejected - IP is blacklisted")
 		return
 	}
