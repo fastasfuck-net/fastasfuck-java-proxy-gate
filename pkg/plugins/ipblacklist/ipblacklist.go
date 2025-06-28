@@ -58,6 +58,18 @@ var Plugin = proxy.Plugin{
 		})
 
 		log.Info("VPN/Proxy Detection Plugin erfolgreich initialisiert!")
+		
+		// Debug: Test API-Verbindung
+		go func() {
+			time.Sleep(2 * time.Second)
+			testResult, err := plugin.checkIP("8.8.8.8")
+			if err != nil {
+				log.Error(err, "API-Test fehlgeschlagen")
+			} else {
+				log.Info("API-Test erfolgreich", "result", testResult)
+			}
+		}()
+		
 		return nil
 	},
 }
@@ -219,6 +231,9 @@ func (p *vpnProxyPlugin) setCachedResult(ipAddr string, result *apiResponse) {
 
 // handleEvent verarbeitet Events
 func (p *vpnProxyPlugin) handleEvent(e event.Event) {
+	// Debug: Alle Events loggen
+	p.log.Info("Event empfangen", "eventType", fmt.Sprintf("%T", e))
+	
 	var ipAddr string
 	var virtualHost string
 	var disconnect func(c.Component)
@@ -226,25 +241,35 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 	// IP-Adresse und Verbindung aus Event extrahieren
 	switch eventType := e.(type) {
 	case *proxy.LoginEvent:
+		p.log.Info("LoginEvent erkannt")
 		if player := eventType.Player(); player != nil {
 			ipAddr = extractIP(player.RemoteAddr())
 			virtualHost = player.VirtualHost().String()
 			disconnect = player.Disconnect
+			p.log.Info("Player-Daten extrahiert", "ip", ipAddr, "virtualHost", virtualHost)
+		} else {
+			p.log.Info("Player ist nil")
 		}
 	default:
+		p.log.Info("Anderer Event-Typ, versuche IP zu extrahieren")
 		ipAddr = tryGetRemoteAddr(e)
 		virtualHost = tryGetVirtualHost(e)
+		p.log.Info("Event-Daten extrahiert", "ip", ipAddr, "virtualHost", virtualHost)
 	}
 
 	if ipAddr == "" {
+		p.log.Info("Keine IP-Adresse gefunden, Event wird ignoriert")
 		return
 	}
 
 	// Lokale und private IPs nicht blockieren
 	ip := net.ParseIP(ipAddr)
 	if ip != nil && (ip.IsLoopback() || ip.IsPrivate()) {
+		p.log.Info("Lokale/private IP erkannt, wird nicht geprüft", "ip", ipAddr)
 		return
 	}
+
+	p.log.Info("IP-Adresse wird geprüft", "ip", ipAddr)
 
 	// Statistiken aktualisieren
 	p.statsMutex.Lock()
@@ -261,6 +286,8 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 		p.statsMutex.Unlock()
 		return
 	}
+
+	p.log.Info("API-Check abgeschlossen", "ip", ipAddr, "isVPN", result.IsVPN)
 
 	// Statistiken aktualisieren
 	if result.IsVPN {
@@ -303,7 +330,7 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 
 	// VPN/Proxy blockieren
 	if result.IsVPN {
-		p.log.Info("VPN/Proxy-Verbindung blockiert",
+		p.log.Info("VPN/Proxy-Verbindung wird blockiert",
 			"ip", ipAddr,
 			"virtualHost", virtualHost,
 			"asn", result.Details.ASN,
@@ -312,16 +339,21 @@ func (p *vpnProxyPlugin) handleEvent(e event.Event) {
 
 		// Disconnect mit Nachricht
 		if disconnect != nil {
+			p.log.Info("Verwende direkte Disconnect-Funktion")
 			disconnect(&c.Text{Content: p.blockMessage})
 			return
 		}
 
 		// Fallback für andere Event-Typen
+		p.log.Info("Versuche Fallback-Disconnect")
 		if tryDisconnect(e, &c.Text{Content: p.blockMessage}) {
+			p.log.Info("Fallback-Disconnect erfolgreich")
 			return
 		}
 
 		p.log.Info("Keine Disconnect-Methode verfügbar", "ip", ipAddr)
+	} else {
+		p.log.Info("Verbindung erlaubt", "ip", ipAddr)
 	}
 }
 
