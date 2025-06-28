@@ -6,6 +6,7 @@ import (
 	"go.minekube.com/gate/pkg/plugins/ipblacklist"
 	"go.minekube.com/gate/pkg/plugins/configdownloader"
 	"go.minekube.com/gate/pkg/plugins/antivpn"
+	"log"
 )
 
 func main() {
