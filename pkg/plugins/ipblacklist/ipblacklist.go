@@ -12,6 +12,7 @@ import (
 	"github.com/robinbraemer/event"
 	"go.minekube.com/common/minecraft/component"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
+	"go.minekube.com/gate/pkg/edition/java/lite/blacklist"
 )
 
 var Plugin = proxy.Plugin{
@@ -21,9 +22,9 @@ var Plugin = proxy.Plugin{
 		log.Info("VPN Blacklist Plugin initializing...")
 
 		event.Subscribe(p.Event(), 0, func(e event.Event) {
-			if login, ok := e.(*proxy.LoginEvent); ok {
-				ip := extractIP(login.Player().RemoteAddr())
-				go checkAndDisconnect(ip, login, log)
+			if postLogin, ok := e.(*proxy.PostLoginEvent); ok {
+				ip := extractIP(postLogin.Player().RemoteAddr())
+				go checkAndKick(ip, postLogin.Player(), log)
 			}
 		})
 
@@ -47,7 +48,7 @@ type vpnResponse struct {
 	IsVPN bool `json:"isVPN"`  // Corrected: API delivers "isVPN", not "vpn"
 }
 
-func checkAndDisconnect(ip string, login *proxy.LoginEvent, log logr.Logger) {
+func checkAndKick(ip string, player proxy.Player, log logr.Logger) {
 	if ip == "" {
 		return
 	}
@@ -57,6 +58,17 @@ func checkAndDisconnect(ip string, login *proxy.LoginEvent, log logr.Logger) {
 		return
 	}
 
+	// First check regular blacklist
+	blacklist.SetLogger(log)
+	if blacklist.CheckIP(ip) {
+		log.Info("Connection blocked by blacklist - sending kick", "ip", ip)
+		player.Disconnect(&component.Text{
+			Content: "§c§lConnection Blocked §7- §4DDoS Protection\n\n§7Your connection was flagged as a §cVPN §7or §cProxy.\n\n§7Not using one? Appeal on Discord:\n§9dc.otp.cx",
+		})
+		return
+	}
+
+	// Then check VPN API
 	log.Info("Checking IP for VPN", "ip", ip)
 
 	// HTTP-Client mit Timeout
@@ -79,8 +91,9 @@ func checkAndDisconnect(ip string, login *proxy.LoginEvent, log logr.Logger) {
 	}
 
 	if data.IsVPN {  // Corrected: data.IsVPN instead of data.isVPN
-		log.Info("Connection from VPN blocked", "ip", ip)
-		login.Player().Disconnect(&component.Text{
+		log.Info("Connection from VPN blocked - sending kick", "ip", ip)
+		// Use Disconnect to send kick packet with formatted message
+		player.Disconnect(&component.Text{
 			Content: "§c§lVPN/Proxy Detected §7- §4Connection Blocked\n\n§7Your connection was flagged as a §cVPN §7or §cProxy.\n\n§7Not using one? Appeal on Discord:\n§9dc.otp.cx",
 		})
 	} else {

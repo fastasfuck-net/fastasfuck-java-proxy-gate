@@ -15,7 +15,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/jellydator/ttlcache/v3"
 	"go.minekube.com/gate/pkg/edition/java/internal/protoutil"
-	"go.minekube.com/gate/pkg/edition/java/lite/blacklist"
 	"go.minekube.com/gate/pkg/edition/java/lite/config"
 	"go.minekube.com/gate/pkg/edition/java/netmc"
 	"go.minekube.com/gate/pkg/edition/java/proto/codec"
@@ -48,18 +47,7 @@ func Forward(
 		return
 	}
 
-	// Setze den Logger für das Blacklist-Paket
-	blacklist.SetLogger(log)
-
-	// Extrahiere die Client-IP und prüfe auf Blacklist
-	clientIP, _, err := net.SplitHostPort(src.RemoteAddr().String())
-	if err == nil && blacklist.CheckIP(clientIP) {
-		sendDisconnect(client, "§c§lConnection Blocked §7- §4DDoS Protection\n\n§7Your connection was flagged as a §cVPN §7or §cProxy.\n\n§7Not using one? Appeal on Discord:\n§9dc.otp.cx", pc.Protocol)
-		log.Info("Connection rejected - IP is blacklisted")
-		return
-	}
-
-	// NEU: Einfache Verbindungs-Detection (ohne IP-Logging)
+	// Simple connection detection logging
 	log.Info("Connection attempt detected", 
 		"protocol", proto.Protocol(handshake.ProtocolVersion).String(),
 		"serverAddress", handshake.ServerAddress)
