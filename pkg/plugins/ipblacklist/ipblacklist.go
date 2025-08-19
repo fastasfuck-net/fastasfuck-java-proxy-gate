@@ -53,11 +53,6 @@ func checkAndKick(ip string, player proxy.Player, log logr.Logger) {
 		return
 	}
 
-	// Skip checking local/private IPs
-	if isLocalIP(ip) {
-		return
-	}
-
 	// First check regular blacklist
 	blacklist.SetLogger(log)
 	if blacklist.CheckIP(ip) {
@@ -68,8 +63,8 @@ func checkAndKick(ip string, player proxy.Player, log logr.Logger) {
 		return
 	}
 
-	// Then check VPN API
-	log.Info("Checking IP for VPN", "ip", ip)
+	// Then check VPN API (now also for local IPs)
+	log.Info("Checking IP for VPN", "ip", ip, "isLocal", isLocalIP(ip))
 
 	// HTTP-Client mit Timeout
 	client := &http.Client{
