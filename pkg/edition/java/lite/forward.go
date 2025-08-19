@@ -43,7 +43,7 @@ func Forward(
 
 	log, src, route, nextBackend, err := findRoute(routes, log, client, handshake)
 	if err != nil {
-		sendDisconnect(client, "Server nicht gefunden", pc.Protocol)
+		sendDisconnect(client, "§c§lServer Not Found §7- §4Connection Failed\n\n§7The requested server could not be located.\n\n§7Please check your connection and try again.", pc.Protocol)
 		errs.V(log, err).Info("failed to find route", "error", err)
 		return
 	}
