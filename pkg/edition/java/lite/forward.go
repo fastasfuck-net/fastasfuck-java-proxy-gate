@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/jellydator/ttlcache/v3"
 	"go.minekube.com/gate/pkg/edition/java/internal/protoutil"
+	"go.minekube.com/gate/pkg/edition/java/lite/blacklist"
 	"go.minekube.com/gate/pkg/edition/java/lite/config"
 	"go.minekube.com/gate/pkg/edition/java/netmc"
 	"go.minekube.com/gate/pkg/edition/java/proto/codec"
@@ -51,6 +53,16 @@ func Forward(
 	log.Info("Connection attempt detected", 
 		"protocol", proto.Protocol(handshake.ProtocolVersion).String(),
 		"serverAddress", handshake.ServerAddress)
+
+	// Extract client IP for VPN/Blacklist checking (SYNCHRONOUS - must block connection)
+	clientIP, _, err := net.SplitHostPort(src.RemoteAddr().String())
+	if err == nil {
+		blocked := checkVPNAndBlock(clientIP, client, pc.Protocol, log)
+		if blocked {
+			log.Info("Connection blocked by VPN/Blacklist - stopping forwarding")
+			return // Stop connection forwarding if blocked
+		}
+	}
 
 	// Find a backend to dial successfully.
 	log, dst, err := tryBackends(nextBackend, func(log logr.Logger, backendAddr string) (logr.Logger, net.Conn, error) {
@@ -336,6 +348,90 @@ func ResetPingCache() {
 
 func init() {
 	go pingCache.Start() // start ttl eviction once
+}
+
+type vpnResponse struct {
+	IsVPN bool `json:"isVPN"`
+}
+
+// checkVPNAndBlock synchronously checks VPN/Blacklist and returns true if blocked
+func checkVPNAndBlock(ip string, client netmc.MinecraftConn, protocol proto.Protocol, log logr.Logger) bool {
+	log.Info("=== VPN/Blacklist Check Started (Gate Lite) ===", "ip", ip)
+	
+	if ip == "" {
+		log.Info("Empty IP address, skipping check")
+		return false
+	}
+
+	// Check if IP is local/private
+	localIP := isLocalIP(ip)
+	log.Info("IP type determined", "ip", ip, "isLocal", localIP)
+
+	// First check regular blacklist
+	log.Info("Checking blacklist files...", "ip", ip)
+	blacklist.SetLogger(log)
+	if blacklist.CheckIP(ip) {
+		log.Info("=== BLACKLIST HIT - BLOCKING CONNECTION ===", "ip", ip, "reason", "file-blacklist")
+		sendDisconnect(client, "§c§lConnection Blocked §7- §4DDoS Protection\n\n§7Your connection was flagged as a §cVPN §7or §cProxy.\n\n§7Not using one? Appeal on Discord:\n§9dc.otp.cx", protocol)
+		return true
+	}
+	log.Info("Blacklist check passed", "ip", ip)
+
+	// Then check VPN API (now also for local IPs)
+	log.Info("=== Starting VPN API Check ===", "ip", ip, "api", "vpn.otp.cx", "isLocal", localIP)
+
+	// HTTP-Client mit Timeout
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	url := fmt.Sprintf("https://vpn.otp.cx/check?ip=%s", ip)
+	log.Info("Making HTTP request to VPN API", "url", url, "timeout", "5s")
+	
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		log.Error(err, "=== VPN API REQUEST FAILED ===", "ip", ip, "url", url)
+		return false
+	}
+	defer resp.Body.Close()
+
+	log.Info("VPN API responded", "ip", ip, "statusCode", resp.StatusCode, "status", resp.Status)
+
+	// Read response body for logging
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Error(err, "Failed to read response body", "ip", ip)
+		return false
+	}
+	
+	log.Info("VPN API raw response", "ip", ip, "response", string(bodyBytes))
+
+	var data vpnResponse
+	if err := json.Unmarshal(bodyBytes, &data); err != nil {
+		log.Error(err, "Error parsing JSON response", "ip", ip, "rawResponse", string(bodyBytes))
+		return false
+	}
+
+	log.Info("VPN API parsed response", "ip", ip, "isVPN", data.IsVPN)
+
+	if data.IsVPN {
+		log.Info("=== VPN DETECTED - BLOCKING CONNECTION ===", "ip", ip, "reason", "vpn-api-positive")
+		sendDisconnect(client, "§c§lVPN/Proxy Detected §7- §4Connection Blocked\n\n§7Your connection was flagged as a §cVPN §7or §cProxy.\n\n§7Not using one? Appeal on Discord:\n§9dc.otp.cx", protocol)
+		return true
+	} else {
+		log.Info("=== IP ALLOWED - Connection permitted ===", "ip", ip, "reason", "clean-ip")
+	}
+	
+	log.Info("=== VPN/Blacklist Check Completed ===", "ip", ip)
+	return false
+}
+
+func isLocalIP(ip string) bool {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
+	}
+	return parsedIP.IsLoopback() || parsedIP.IsPrivate()
 }
 
 type pingKey struct {
